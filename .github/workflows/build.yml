@@ -8,12 +8,13 @@ jobs:
     runs-on: windows-2022
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout source
+      uses: actions/checkout@v4
 
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
 
-    - name: Convert v145 to v143
+    - name: Convert toolset v145 -> v143
       shell: powershell
       run: |
         Get-ChildItem -Recurse *.vcxproj | ForEach-Object {
@@ -21,11 +22,28 @@ jobs:
           Set-Content $_.FullName
         }
 
-    - name: Build
+    - name: Build projects
+      shell: cmd
       run: |
-        msbuild src\wolf.sln /p:Configuration=Release /p:Platform=Win32
+        msbuild src\botlib\botlib.vcxproj /p:Configuration=Release /p:Platform=x64
+        if errorlevel 1 exit /b 1
 
-    - name: Upload build
+        msbuild src\renderer\renderer.vcxproj /p:Configuration=Release /p:Platform=x64
+        if errorlevel 1 exit /b 1
+
+        msbuild src\cgame\cgame.vcxproj /p:Configuration=Release /p:Platform=x64
+        if errorlevel 1 exit /b 1
+
+        msbuild src\ui\ui.vcxproj /p:Configuration=Release /p:Platform=x64
+        if errorlevel 1 exit /b 1
+
+        msbuild src\game\game.vcxproj /p:Configuration=Release /p:Platform=x64
+        if errorlevel 1 exit /b 1
+
+        msbuild src\wolf\wolf.vcxproj /p:Configuration=Release /p:Platform=x64
+        if errorlevel 1 exit /b 1
+
+    - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: DarkWolf
