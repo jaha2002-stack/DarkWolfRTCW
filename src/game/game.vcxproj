@@ -237,56 +237,72 @@
     </Bscmake>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <Midl>
-      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <MkTypLibCompatible>true</MkTypLibCompatible>
-      <SuppressStartupBanner>true</SuppressStartupBanner>
-      <TypeLibraryName>.\Release/game.tlb</TypeLibraryName>
-      <HeaderFileName>
-      </HeaderFileName>
-    </Midl>
-    <ClCompile>
-      <Optimization>MaxSpeed</Optimization>
-      <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;GAMEDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <StringPooling>true</StringPooling>
-      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <FunctionLevelLinking>true</FunctionLevelLinking>
-      <PrecompiledHeaderOutputFile>.\Release/game.pch</PrecompiledHeaderOutputFile>
-      <AssemblerListingLocation>.\Release/</AssemblerListingLocation>
-      <ObjectFileName>.\Release/</ObjectFileName>
-      <ProgramDataBaseFileName>.\Release/</ProgramDataBaseFileName>
-      <WarningLevel>Level4</WarningLevel>
-      <SuppressStartupBanner>true</SuppressStartupBanner>
-    </ClCompile>
-    <ResourceCompile>
-      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <Culture>0x0409</Culture>
-    </ResourceCompile>
-    <PreLinkEvent>
-      <Message>Building game function table...</Message>
-      <Command>..\extractfuncs\extractfuncs.bat</Command>
-    </PreLinkEvent>
-    <Link>
-      <AdditionalDependencies>winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <OutputFile>../../main/qagamex64.dll</OutputFile>
-      <SuppressStartupBanner>true</SuppressStartupBanner>
-      <ModuleDefinitionFile>.\game.def</ModuleDefinitionFile>
-      <ProgramDatabaseFile>.\Release/qagamex86.pdb</ProgramDatabaseFile>
-      <GenerateMapFile>true</GenerateMapFile>
-      <MapFileName>.\Release/qagamex86.map</MapFileName>
-      <SubSystem>Windows</SubSystem>
-      <BaseAddress>0x20000000</BaseAddress>
-      <RandomizedBaseAddress>false</RandomizedBaseAddress>
-      <DataExecutionPrevention>
-      </DataExecutionPrevention>
-      <ImportLibrary>.\Release/qagamex86.lib</ImportLibrary>
-    </Link>
-    <Bscmake>
-      <SuppressStartupBanner>true</SuppressStartupBanner>
-      <OutputFile>.\Release/game.bsc</OutputFile>
-    </Bscmake>
-  </ItemDefinitionGroup>
+  <Midl>
+    <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    <MkTypLibCompatible>true</MkTypLibCompatible>
+    <SuppressStartupBanner>true</SuppressStartupBanner>
+    <TypeLibraryName>.\x64\Release\game.tlb</TypeLibraryName>
+    <HeaderFileName>
+    </HeaderFileName>
+  </Midl>
+
+  <ClCompile>
+    <Optimization>MaxSpeed</Optimization>
+    <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
+    <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;GAMEDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    <StringPooling>true</StringPooling>
+    <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+    <FunctionLevelLinking>true</FunctionLevelLinking>
+
+    <PrecompiledHeaderOutputFile>.\x64\Release\game.pch</PrecompiledHeaderOutputFile>
+    <AssemblerListingLocation>.\x64\Release\</AssemblerListingLocation>
+    <ObjectFileName>.\x64\Release\</ObjectFileName>
+    <ProgramDataBaseFileName>.\x64\Release\</ProgramDataBaseFileName>
+
+    <WarningLevel>Level4</WarningLevel>
+    <SuppressStartupBanner>true</SuppressStartupBanner>
+  </ClCompile>
+
+  <ResourceCompile>
+    <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    <Culture>0x0409</Culture>
+  </ResourceCompile>
+
+  <PreLinkEvent>
+    <Message>Building game function table...</Message>
+    <Command>..\extractfuncs\extractfuncs.bat</Command>
+  </PreLinkEvent>
+
+  <Link>
+    <AdditionalDependencies>winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+
+    <OutputFile>../../main/qagamex64.dll</OutputFile>
+
+    <SuppressStartupBanner>true</SuppressStartupBanner>
+
+    <ModuleDefinitionFile>.\game.def</ModuleDefinitionFile>
+
+    <ProgramDatabaseFile>.\x64\Release\qagamex64.pdb</ProgramDatabaseFile>
+
+    <GenerateMapFile>true</GenerateMapFile>
+    <MapFileName>.\x64\Release\qagamex64.map</MapFileName>
+
+    <SubSystem>Windows</SubSystem>
+    <BaseAddress>0x20000000</BaseAddress>
+
+    <RandomizedBaseAddress>false</RandomizedBaseAddress>
+
+    <DataExecutionPrevention>
+    </DataExecutionPrevention>
+
+    <ImportLibrary>.\x64\Release\qagamex64.lib</ImportLibrary>
+  </Link>
+
+  <Bscmake>
+    <SuppressStartupBanner>true</SuppressStartupBanner>
+    <OutputFile>.\x64\Release\game.bsc</OutputFile>
+  </Bscmake>
+</ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\botai\ai_chat.cpp" />
     <ClCompile Include="..\botai\ai_cmd.cpp" />
