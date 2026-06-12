@@ -23,7 +23,7 @@ jobs:
 
     - name: Build
       run: |
-        msbuild src\wolf.vcxproj /p:Configuration=Release /p:Platform=x64
+        msbuild src\wolf.sln /p:Configuration=Release /p:Platform=Win32
 
     - name: Upload build
       uses: actions/upload-artifact@v4
