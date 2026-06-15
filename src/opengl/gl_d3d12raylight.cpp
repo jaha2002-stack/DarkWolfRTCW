@@ -46,8 +46,7 @@ static void glRaytracingFatal(const char* fmt, ...)
 	va_end(args);
 	OutputDebugStringA(buffer);
 	OutputDebugStringA("\n");
-	MessageBoxA(nullptr, buffer, "glRaytracing Fatal", MB_OK | MB_ICONERROR);
-	DebugBreak();
+	Com_Printf("^1DXR ERROR:^7 %s\n", buffer);
 }
 
 #define GLR_CHECK(x) \
@@ -229,7 +228,7 @@ static void glRaytracingWaitFenceValue(UINT64 value)
 		return;
 
 	g_glRaytracingCmd.fence->SetEventOnCompletion(value, g_glRaytracingCmd.fenceEvent);
-	WaitForSingleObject(g_glRaytracingCmd.fenceEvent, INFINITE);
+	//WaitForSingleObject(//g_glRaytracingCmd.fenceEvent, //INFINITE);
 }
 
 static UINT64 glRaytracingSignalQueue(void)
@@ -244,8 +243,6 @@ static UINT64 glRaytracingSignalQueue(void)
 
 static void glRaytracingWaitIdle(void)
 {
-	const UINT64 value = glRaytracingSignalQueue();
-	glRaytracingWaitFenceValue(value);
 }
 
 static int glRaytracingInitCmdContext(void)
@@ -352,14 +349,15 @@ static int glRaytracingEndCmd(void)
 	ID3D12CommandList* lists[] = { g_glRaytracingCmd.cmdList.Get() };
 	g_glRaytracingCmd.queue->ExecuteCommandLists(1, lists);
 
-	g_glRaytracingCmd.cmdLastFenceValue = glRaytracingSignalQueue();
-	glRaytracingWaitFenceValue(g_glRaytracingCmd.cmdLastFenceValue);
-	return 1;
+	g_glRaytracingCmd.cmdLastFenceValue =
+    glRaytracingSignalQueue();
+
+return 1;
 }
 
 static int glRaytracingBeginBlasCmd(void)
 {
-	glRaytracingWaitFenceValue(g_glRaytracingCmd.blasLastFenceValue);
+	//glRaytracingWaitFenceValue(g_glRaytracingCmd.blasLastFenceValue);
 
 	GLR_CHECK(g_glRaytracingCmd.blasCmdAlloc->Reset());
 	GLR_CHECK(g_glRaytracingCmd.blasCmdList->Reset(g_glRaytracingCmd.blasCmdAlloc.Get(), nullptr));
@@ -989,7 +987,7 @@ static int glRaytracingBuildDirtyMeshesInternal(void)
 	if (!blasFenceValue)
 		return 0;
 
-	glRaytracingWaitFenceValue(blasFenceValue);
+	//glRaytracingWaitFenceValue(blasFenceValue);
 
 	for (size_t i = 0; i < builds.size(); ++i)
 	{
@@ -1197,7 +1195,7 @@ static int glRaytracingBuildSceneInternal(void)
 	glRaytracingBuffer_t* dstTLAS = glRaytracingGetBuildTLASBuffer();
 	const glRaytracingBuffer_t* srcTLAS = glRaytracingGetCurrentTLASBufferConst();
 
-	glRaytracingWaitFenceValue(g_glRaytracingCmd.blasLastFenceValue);
+	//glRaytracingWaitFenceValue(g_glRaytracingCmd.blasLastFenceValue);
 
 	if (!glRaytracingBeginTlasCmd())
 		return 0;
@@ -1225,7 +1223,7 @@ static int glRaytracingBuildSceneInternal(void)
 	if (!tlasFenceValue)
 		return 0;
 
-	glRaytracingWaitFenceValue(tlasFenceValue);
+	//glRaytracingWaitFenceValue(tlasFenceValue);
 
 	g_glRaytracingScene.currentTLASIndex = glRaytracingGetInactiveTLASIndex();
 	g_glRaytracingScene.activeInstanceCount = activeCount;
