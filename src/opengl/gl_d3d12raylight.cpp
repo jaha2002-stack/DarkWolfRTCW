@@ -221,14 +221,6 @@ static glRaytracingCmdContext_t g_glRaytracingCmd;
 
 static void glRaytracingWaitFenceValue(UINT64 value)
 {
-	if (!value || !g_glRaytracingCmd.fence)
-		return;
-
-	if (g_glRaytracingCmd.fence->GetCompletedValue() >= value)
-		return;
-
-	g_glRaytracingCmd.fence->SetEventOnCompletion(value, g_glRaytracingCmd.fenceEvent);
-	//WaitForSingleObject(//g_glRaytracingCmd.fenceEvent, //INFINITE);
 }
 
 static UINT64 glRaytracingSignalQueue(void)
@@ -335,7 +327,8 @@ static void glRaytracingShutdownCmdContext(void)
 
 static int glRaytracingBeginCmd(void)
 {
-	glRaytracingWaitFenceValue(g_glRaytracingCmd.cmdLastFenceValue);
+	//glRaytracingWaitFenceValue
+		//(g_glRaytracingCmd.cmdLastFenceValue);
 
 	GLR_CHECK(g_glRaytracingCmd.cmdAlloc->Reset());
 	GLR_CHECK(g_glRaytracingCmd.cmdList->Reset(g_glRaytracingCmd.cmdAlloc.Get(), nullptr));
