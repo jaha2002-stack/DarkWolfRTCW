@@ -1,5 +1,9 @@
 #include "opengl.h"
 
+#if defined(_MSC_VER)
+extern void __cdecl Com_Printf(const char* fmt, ...);
+#endif
+
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
