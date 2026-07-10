@@ -1,0 +1,53 @@
+name: DarkWolf DXR Patch Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_variant:
+        description: Patch to apply before build
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - minimal
+          - none
+      configuration:
+        description: Build configuration
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Apply selected DXR patch
+        shell: pwsh
+        run: |
+          ./scripts/apply-selected.ps1 -Variant '${{ inputs.patch_variant }}'
+
+      - name: Build DarkWolf
+        shell: pwsh
+        run: |
+          ./scripts/build-windows.ps1 -Configuration '${{ inputs.configuration }}'
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-DXR-${{ inputs.patch_variant }}-${{ inputs.configuration }}
+          path: dist/**
+          if-no-files-found: error
