@@ -1,0 +1,45 @@
+name: DarkWolf DXR Visibility Debug Full Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Build configuration
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Apply full DXR visibility/debug patch stack
+        shell: pwsh
+        run: ./scripts/apply-dxr-visibility-debug-full.ps1
+
+      - name: Build DarkWolf
+        shell: pwsh
+        run: ./scripts/build-windows.ps1 -Configuration '${{ inputs.configuration }}'
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-DXR-Visibility-Debug-Full-${{ inputs.configuration }}
+          path: |
+            src/**/*.exe
+            src/**/*.dll
+            src/**/*.pdb
+            src/**/*.lib
+            bin_nt/**/*
+          if-no-files-found: warn
