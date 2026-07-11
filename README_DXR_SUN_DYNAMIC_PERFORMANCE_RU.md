@@ -100,3 +100,8 @@ Artifact должен называться примерно:
 ```
 
 Но для игры держи `developer 0`, `logfile 0`, `r_dxrDebug 0`, иначе логирование само по себе может создавать лаги.
+
+
+## Исправление v2
+
+В этой версии исправлен шаг GitHub Actions `Upload runtime artifact`: теперь artifact берется из `dist/**`, потому что скрипт сборки создает runtime-пакет прямо в папке `dist`, а не в `dist/runtime`. Ошибка `No files were found with the provided path: dist/runtime/**` устранена.
