@@ -1,0 +1,38 @@
+name: DarkWolf DXR Sun Dynamic Performance Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Apply DXR sun dynamic performance full stack
+        shell: pwsh
+        run: ./scripts/apply-dxr-sun-dynamic-performance-full.ps1
+
+      - name: Build clean runtime release
+        shell: pwsh
+        run: ./scripts/build-windows-clean-release.ps1 -Configuration '${{ inputs.configuration }}'
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-DXR-Sun-Dynamic-Performance-${{ inputs.configuration }}
+          path: dist/runtime/**
+          if-no-files-found: error
