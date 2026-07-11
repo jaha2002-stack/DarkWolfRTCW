@@ -1,0 +1,614 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index ae828e3..2575512 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -20,6 +20,7 @@ extern void __cdecl Com_Printf(const char* fmt, ...);
+ #include <stdio.h>
+ #include <stdarg.h>
+ #include <assert.h>
++#include <math.h>
+ 
+ #pragma comment(lib, "dxcompiler.lib")
+ #pragma comment(lib, "d3dcompiler.lib")
+@@ -1551,12 +1552,26 @@ struct glRaytracingLightingConstants_t
+ 	float exposure;
+ 	float legacyBlend;
+ 	uint32_t debugMode;
++
++	uint32_t maxActiveLights;
++	uint32_t maxShadowSamples;
++	uint32_t aoSamples;
++	uint32_t skySamples;
++
++	uint32_t sunEnabled;
++	float sunIntensity;
++	float sunShadowStrength;
++	float sunPad0;
++	float sunDirection[4];
++	float sunColor[4];
+ };
+ 
+ struct glRaytracingLightingState_t
+ {
+ 	std::vector<glRaytracingLight_t> cpuLights;
++	std::vector<glRaytracingLight_t> uploadLights;
+ 	glRaytracingLightingConstants_t constants;
++	uint32_t syncAfterDispatch;
+ 
+ 	ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+ 	UINT descriptorStride;
+@@ -1579,7 +1594,21 @@ struct glRaytracingLightingState_t
+ 	glRaytracingLightingState_t()
+ 	{
+ 		memset(&constants, 0, sizeof(constants));
++		constants.maxActiveLights = 8;
++		constants.maxShadowSamples = 2;
++		constants.aoSamples = 0;
++		constants.skySamples = 1;
++		constants.sunEnabled = 0;
++		constants.sunIntensity = 0.0f;
++		constants.sunShadowStrength = 0.75f;
++		constants.sunDirection[0] = 0.25f;
++		constants.sunDirection[1] = 0.15f;
++		constants.sunDirection[2] = 0.96f;
++		constants.sunColor[0] = 1.0f;
++		constants.sunColor[1] = 0.92f;
++		constants.sunColor[2] = 0.80f;
+ 		descriptorStride = 0;
++		syncAfterDispatch = 0;
+ 		initialized = false;
+ 	}
+ };
+@@ -1629,6 +1658,18 @@ cbuffer LightingCB : register(b0)
+     float    gExposure;
+     float    gLegacyBlend;
+     uint     gDebugMode;
++
++    uint     gMaxActiveLights;
++    uint     gMaxShadowSamples;
++    uint     gAOSamples;
++    uint     gSkySamples;
++
++    uint     gSunEnabled;
++    float    gSunIntensity;
++    float    gSunShadowStrength;
++    float    gSunPad0;
++    float4   gSunDirection;
++    float4   gSunColor;
+ };
+ 
+ StructuredBuffer<Light> gLights : register(t0);
+@@ -1753,7 +1794,7 @@ float3 CosineSampleHemisphere(float2 u)
+ 
+ float TraceSoftShadow(float3 worldPos, float3 N, Light Lgt, float3 toLight, float dist)
+ {
+-    const uint SHADOW_SAMPLES = 12;
++    uint shadowSamples = clamp(gMaxShadowSamples, 1u, 12u);
+ 
+     float3 L = toLight / max(dist, 1e-6);
+ 
+@@ -1765,10 +1806,10 @@ float TraceSoftShadow(float3 worldPos, float3 N, Light Lgt, float3 toLight, floa
+     float shadowAccum = 0.0;
+     float rand = Hash12(worldPos.xy + float2(worldPos.z, dist));
+ 
+-    [unroll]
+-    for (uint s = 0; s < SHADOW_SAMPLES; ++s)
++    [loop]
++    for (uint s = 0; s < shadowSamples; ++s)
+     {
+-        float2 xi = Hammersley2D(s, SHADOW_SAMPLES, rand);
++        float2 xi = Hammersley2D(s, shadowSamples, rand);
+         float2 d  = ConcentricSampleDisk(xi) * areaRadius;
+ 
+         float3 sampleLightPos = Lgt.position + tangent * d.x + bitangent * d.y;
+@@ -1792,12 +1833,13 @@ float TraceSoftShadow(float3 worldPos, float3 N, Light Lgt, float3 toLight, floa
+         shadowAccum += TraceShadow(shadowOrigin, sampleDir, shadowTMax);
+     }
+ 
+-    return shadowAccum / (float)SHADOW_SAMPLES;
++    return shadowAccum / (float)shadowSamples;
+ }
+ 
+ float RectLightShadow(float3 worldPos, float3 N, Light Lgt, uint2 pixel)
+ {
+     uint sampleCount = max(Lgt.samples, 1u);
++    sampleCount = min(sampleCount, max(gMaxShadowSamples, 1u));
+     sampleCount = min(sampleCount, 16u);
+ 
+     float visibility = 0.0;
+@@ -1856,8 +1898,11 @@ float RectLightShadow(float3 worldPos, float3 N, Light Lgt, uint2 pixel)
+ 
+ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+ {
+-    const uint AO_SAMPLES = 24;
+-    const float AO_RADIUS = 32.0;
++    if (gAOSamples == 0u)
++        return 1.0;
++
++    uint aoSamples = clamp(gAOSamples, 1u, 24u);
++    const float AO_RADIUS = 24.0;
+ 
+     float3 tangent, bitangent;
+     BuildOrthonormalBasis(N, tangent, bitangent);
+@@ -1866,10 +1911,10 @@ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+ 
+     float visibility = 0.0;
+ 
+-    [unroll]
+-    for (uint i = 0; i < AO_SAMPLES; ++i)
++    [loop]
++    for (uint i = 0; i < aoSamples; ++i)
+     {
+-        float2 xi = Hammersley2D(i, AO_SAMPLES, rand);
++        float2 xi = Hammersley2D(i, aoSamples, rand);
+         float3 h  = CosineSampleHemisphere(xi);
+ 
+         float3 aoDir =
+@@ -1884,7 +1929,7 @@ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+         visibility += TraceShadow(aoOrigin, aoDir, AO_RADIUS);
+     }
+ 
+-    visibility /= (float)AO_SAMPLES;
++    visibility /= (float)aoSamples;
+     visibility = saturate(pow(visibility, 1.5));
+ 
+     return visibility;
+@@ -1893,7 +1938,10 @@ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+ 
+ float ComputeSkyVisibility(float3 worldPos, float3 N, uint2 pixel)
+ {
+-    const uint SKY_SAMPLES = 8;
++    if (gSkySamples == 0u)
++        return 1.0;
++
++    uint skySamples = clamp(gSkySamples, 1u, 8u);
+     const float SKY_TMAX   = 1000000.0;
+ 
+     float3 tangent, bitangent;
+@@ -1903,10 +1951,10 @@ float ComputeSkyVisibility(float3 worldPos, float3 N, uint2 pixel)
+ 
+     float vis = 0.0;
+ 
+-    [unroll]
+-    for (uint i = 0; i < SKY_SAMPLES; ++i)
++    [loop]
++    for (uint i = 0; i < skySamples; ++i)
+     {
+-        float2 xi = Hammersley2D(i, SKY_SAMPLES, rand);
++        float2 xi = Hammersley2D(i, skySamples, rand);
+         float3 h  = CosineSampleHemisphere(xi);
+ 
+         float3 skyDir =
+@@ -1923,7 +1971,7 @@ float ComputeSkyVisibility(float3 worldPos, float3 N, uint2 pixel)
+         vis += TraceShadow(skyOrigin, skyDir, SKY_TMAX);
+     }
+ 
+-    vis /= (float)SKY_SAMPLES;
++    vis /= (float)skySamples;
+     return saturate(vis);
+ }
+ 
+@@ -2059,6 +2107,20 @@ void RayGen()
+         lightingAccum += 0.15;
+     }
+ 
++    if (gSunEnabled != 0u && gSunIntensity > 0.0)
++    {
++        float3 sunL = normalize(gSunDirection.xyz);
++        float sunNoL = saturate(dot(N, sunL));
++        if (sunNoL > 0.0001)
++        {
++            float3 sunOrigin = worldPos + N * (gShadowBias * 3.0) + sunL * (gShadowBias * 2.0);
++            float sunVis = TraceShadow(sunOrigin, sunL, 1000000.0);
++            float sunShadow = lerp(1.0, sunVis, saturate(gSunShadowStrength));
++            lightingAccum += gSunColor.rgb * (gSunIntensity * sunNoL * sunShadow);
++            specularAccum += ComputeSpecular(N, V, sunL, gSunColor.rgb, gSunIntensity, 1.0, sunShadow, baseAlbedo);
++        }
++    }
++
+     [loop]
+     for (uint i = 0; i < gLightCount; ++i)
+     {
+@@ -2377,15 +2439,55 @@ static void glRaytracingLightingUpdateConstants(void)
+ 		sizeof(g_glRaytracingLighting.constants));
+ }
+ 
++static float glRaytracingLightScoreForCamera(const glRaytracingLight_t& light)
++{
++	const float dx = light.position.x - g_glRaytracingLighting.constants.cameraPos[0];
++	const float dy = light.position.y - g_glRaytracingLighting.constants.cameraPos[1];
++	const float dz = light.position.z - g_glRaytracingLighting.constants.cameraPos[2];
++	const float distSq = dx * dx + dy * dy + dz * dz;
++	const float power = glRaytracingClamp(light.intensity, 0.05f, 1000.0f) * glRaytracingClamp(light.radius, 1.0f, 100000.0f);
++	return distSq / power;
++}
++
++static void glRaytracingLightingSelectUploadLights(uint32_t activeCount)
++{
++	g_glRaytracingLighting.uploadLights.clear();
++
++	if (activeCount == 0 || g_glRaytracingLighting.cpuLights.empty())
++		return;
++
++	if (g_glRaytracingLighting.cpuLights.size() <= activeCount)
++	{
++		g_glRaytracingLighting.uploadLights = g_glRaytracingLighting.cpuLights;
++		return;
++	}
++
++	g_glRaytracingLighting.uploadLights = g_glRaytracingLighting.cpuLights;
++	std::stable_sort(
++		g_glRaytracingLighting.uploadLights.begin(),
++		g_glRaytracingLighting.uploadLights.end(),
++		[](const glRaytracingLight_t& a, const glRaytracingLight_t& b)
++		{
++			return glRaytracingLightScoreForCamera(a) < glRaytracingLightScoreForCamera(b);
++		});
++
++	g_glRaytracingLighting.uploadLights.resize(activeCount);
++}
++
+ static void glRaytracingLightingUpdateLights(void)
+ {
+-	if (g_glRaytracingLighting.cpuLights.empty())
++	const uint32_t activeCount = g_glRaytracingLighting.constants.lightCount;
++	if (activeCount == 0)
++		return;
++
++	glRaytracingLightingSelectUploadLights(activeCount);
++	if (g_glRaytracingLighting.uploadLights.empty())
+ 		return;
+ 
+ 	glRaytracingMapCopy(
+ 		g_glRaytracingLighting.lightBuffer.resource.Get(),
+-		g_glRaytracingLighting.cpuLights.data(),
+-		g_glRaytracingLighting.cpuLights.size() * sizeof(glRaytracingLight_t));
++		g_glRaytracingLighting.uploadLights.data(),
++		g_glRaytracingLighting.uploadLights.size() * sizeof(glRaytracingLight_t));
+ }
+ 
+ static void glRaytracingLightingCreatePersistentLightSRV(void)
+@@ -2654,6 +2756,20 @@ bool glRaytracingLightingInit(void)
+ 	g_glRaytracingLighting.constants.exposure = 1.15f;
+ 	g_glRaytracingLighting.constants.legacyBlend = 0.65f;
+ 	g_glRaytracingLighting.constants.debugMode = 0u;
++	g_glRaytracingLighting.constants.maxActiveLights = 8;
++	g_glRaytracingLighting.constants.maxShadowSamples = 2;
++	g_glRaytracingLighting.constants.aoSamples = 0;
++	g_glRaytracingLighting.constants.skySamples = 1;
++	g_glRaytracingLighting.constants.sunEnabled = 0u;
++	g_glRaytracingLighting.constants.sunIntensity = 0.0f;
++	g_glRaytracingLighting.constants.sunShadowStrength = 0.75f;
++	g_glRaytracingLighting.constants.sunDirection[0] = 0.25f;
++	g_glRaytracingLighting.constants.sunDirection[1] = 0.15f;
++	g_glRaytracingLighting.constants.sunDirection[2] = 0.96f;
++	g_glRaytracingLighting.constants.sunColor[0] = 1.0f;
++	g_glRaytracingLighting.constants.sunColor[1] = 0.92f;
++	g_glRaytracingLighting.constants.sunColor[2] = 0.80f;
++	g_glRaytracingLighting.syncAfterDispatch = 0u;
+ 
+ 	glRaytracingLightingUpdateConstants();
+ 
+@@ -2701,7 +2817,8 @@ void glRaytracingLightingClearLights(bool clearPersistant)
+ 	}
+ 
+ 	g_glRaytracingLighting.constants.lightCount =
+-		(uint32_t)g_glRaytracingLighting.cpuLights.size();
++		(uint32_t)glRaytracingClamp<size_t>(g_glRaytracingLighting.cpuLights.size(), 0,
++			g_glRaytracingLighting.constants.maxActiveLights ? g_glRaytracingLighting.constants.maxActiveLights : GL_RAYTRACING_MAX_LIGHTS);
+ 
+ 	glRaytracingLightingUpdateConstants();
+ }
+@@ -2715,9 +2832,10 @@ bool glRaytracingLightingAddLight(const glRaytracingLight_t* light)
+ 		return false;
+ 
+ 	g_glRaytracingLighting.cpuLights.push_back(*light);
+-	g_glRaytracingLighting.constants.lightCount = (uint32_t)g_glRaytracingLighting.cpuLights.size();
++	g_glRaytracingLighting.constants.lightCount =
++		(uint32_t)glRaytracingClamp<size_t>(g_glRaytracingLighting.cpuLights.size(), 0,
++			g_glRaytracingLighting.constants.maxActiveLights ? g_glRaytracingLighting.constants.maxActiveLights : GL_RAYTRACING_MAX_LIGHTS);
+ 
+-	glRaytracingLightingUpdateLights();
+ 	glRaytracingLightingUpdateConstants();
+ 	return true;
+ }
+@@ -2800,6 +2918,41 @@ void glRaytracingLightingSetDebugMode(uint32_t mode)
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++void glRaytracingLightingSetPerformance(uint32_t maxLights, uint32_t shadowSamples, uint32_t aoSamples, uint32_t skySamples, int syncAfterDispatch)
++{
++	g_glRaytracingLighting.constants.maxActiveLights = glRaytracingClamp<uint32_t>(maxLights, 0u, (uint32_t)GL_RAYTRACING_MAX_LIGHTS);
++	g_glRaytracingLighting.constants.maxShadowSamples = glRaytracingClamp<uint32_t>(shadowSamples, 1u, 12u);
++	g_glRaytracingLighting.constants.aoSamples = glRaytracingClamp<uint32_t>(aoSamples, 0u, 24u);
++	g_glRaytracingLighting.constants.skySamples = glRaytracingClamp<uint32_t>(skySamples, 0u, 8u);
++	g_glRaytracingLighting.syncAfterDispatch = syncAfterDispatch ? 1u : 0u;
++	glRaytracingLightingUpdateConstants();
++}
++
++void glRaytracingLightingSetSun(int enabled, float dirX, float dirY, float dirZ, float r, float g, float b, float intensity, float shadowStrength)
++{
++	float len = sqrtf(dirX * dirX + dirY * dirY + dirZ * dirZ);
++	if (len < 0.0001f)
++	{
++		dirX = 0.25f;
++		dirY = 0.15f;
++		dirZ = 0.96f;
++		len = sqrtf(dirX * dirX + dirY * dirY + dirZ * dirZ);
++	}
++
++	g_glRaytracingLighting.constants.sunEnabled = enabled ? 1u : 0u;
++	g_glRaytracingLighting.constants.sunDirection[0] = dirX / len;
++	g_glRaytracingLighting.constants.sunDirection[1] = dirY / len;
++	g_glRaytracingLighting.constants.sunDirection[2] = dirZ / len;
++	g_glRaytracingLighting.constants.sunDirection[3] = 0.0f;
++	g_glRaytracingLighting.constants.sunColor[0] = r;
++	g_glRaytracingLighting.constants.sunColor[1] = g;
++	g_glRaytracingLighting.constants.sunColor[2] = b;
++	g_glRaytracingLighting.constants.sunColor[3] = 0.0f;
++	g_glRaytracingLighting.constants.sunIntensity = glRaytracingClamp<float>(intensity, 0.0f, 10.0f);
++	g_glRaytracingLighting.constants.sunShadowStrength = glRaytracingClamp<float>(shadowStrength, 0.0f, 1.0f);
++	glRaytracingLightingUpdateConstants();
++}
++
+ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ {
+ 	if (!g_glRaytracingLighting.initialized || !pass)
+@@ -2822,8 +2975,11 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	g_glRaytracingLighting.constants.screenSize[1] = (float)pass->height;
+ 	g_glRaytracingLighting.constants.screenSize[2] = 1.0f / (float)pass->width;
+ 	g_glRaytracingLighting.constants.screenSize[3] = 1.0f / (float)pass->height;
++	const uint32_t maxActiveLights = g_glRaytracingLighting.constants.maxActiveLights
++		? g_glRaytracingLighting.constants.maxActiveLights
++		: (uint32_t)GL_RAYTRACING_MAX_LIGHTS;
+ 	g_glRaytracingLighting.constants.lightCount =
+-		(uint32_t)glRaytracingClamp<size_t>(g_glRaytracingLighting.cpuLights.size(), 0, GL_RAYTRACING_MAX_LIGHTS);
++		(uint32_t)glRaytracingClamp<size_t>(g_glRaytracingLighting.cpuLights.size(), 0, maxActiveLights);
+ 
+ 	glRaytracingLightingUpdateLights();
+ 	glRaytracingLightingUpdateConstants();
+@@ -2896,10 +3052,10 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	if (!glRaytracingEndCmd())
+ 		return false;
+ 
+-	// Stable mode keeps the external DXR command list synchronous with the
+-	// OpenGL shim.  This is slower than a fully pipelined renderer, but it
+-	// avoids read-after-write hazards while validating the ray traced path.
+-	glRaytracingWaitFenceValue(g_glRaytracingCmd.cmdLastFenceValue);
++	if (g_glRaytracingLighting.syncAfterDispatch)
++	{
++		glRaytracingWaitFenceValue(g_glRaytracingCmd.cmdLastFenceValue);
++	}
+ 
+ 	return true;
+ }
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index 2346afb..7644210 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1710,6 +1710,8 @@ void                       glRaytracingLightingSetShadowBias(float bias);
+ void                       glRaytracingLightingSetExposure(float exposure);
+ void                       glRaytracingLightingSetLegacyBlend(float legacyBlend);
+ void                       glRaytracingLightingSetDebugMode(uint32_t mode);
++void                       glRaytracingLightingSetPerformance(uint32_t maxLights, uint32_t shadowSamples, uint32_t aoSamples, uint32_t skySamples, int syncAfterDispatch);
++void                       glRaytracingLightingSetSun(int enabled, float dirX, float dirY, float dirZ, float r, float g, float b, float intensity, float shadowStrength);
+ 
+ bool                       glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass);
+ 
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index 1204b8e..1d4c97d 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1140,6 +1140,96 @@ static void RB_AddDXRFallbackLightIfNeeded(void)
+ 	glRaytracingLightingAddLight(&light);
+ }
+ 
++static void RB_ApplyDXRPerformanceSettings(void)
++{
++	int preset = r_dxrPerfPreset ? r_dxrPerfPreset->integer : 1;
++	int maxLights = r_dxrMaxLights ? r_dxrMaxLights->integer : 8;
++	int shadowSamples = r_dxrShadowSamples ? r_dxrShadowSamples->integer : 2;
++	int aoSamples = r_dxrAOSamples ? r_dxrAOSamples->integer : 0;
++	int skySamples = r_dxrSkySamples ? r_dxrSkySamples->integer : 1;
++
++	if (preset < 0)
++		preset = 0;
++	if (preset > 4)
++		preset = 4;
++
++	switch (preset)
++	{
++	case 1: // Low / playable: biggest FPS win.
++		maxLights = 6;
++		shadowSamples = 1;
++		aoSamples = 0;
++		skySamples = 0;
++		break;
++	case 2: // Balanced.
++		maxLights = 10;
++		shadowSamples = 2;
++		aoSamples = 0;
++		skySamples = 1;
++		break;
++	case 3: // High.
++		maxLights = 18;
++		shadowSamples = 3;
++		aoSamples = 1;
++		skySamples = 2;
++		break;
++	case 4: // Cinematic / screenshots.
++		maxLights = 32;
++		shadowSamples = 6;
++		aoSamples = 4;
++		skySamples = 3;
++		break;
++	case 0:
++	default:
++		break;
++	}
++
++	if (maxLights < 0) maxLights = 0;
++	if (maxLights > 128) maxLights = 128;
++	if (shadowSamples < 1) shadowSamples = 1;
++	if (shadowSamples > 12) shadowSamples = 12;
++	if (aoSamples < 0) aoSamples = 0;
++	if (aoSamples > 24) aoSamples = 24;
++	if (skySamples < 0) skySamples = 0;
++	if (skySamples > 8) skySamples = 8;
++
++	glRaytracingLightingSetPerformance(
++		(uint32_t)maxLights,
++		(uint32_t)shadowSamples,
++		(uint32_t)aoSamples,
++		(uint32_t)skySamples,
++		r_dxrSync ? r_dxrSync->integer : 0);
++}
++
++static void RB_ApplyDXRSunSettings(void)
++{
++	int enabled = r_dxrSunEnable ? r_dxrSunEnable->integer : 0;
++	float intensity = r_dxrSunIntensity ? r_dxrSunIntensity->value : 0.65f;
++	float pitch = r_dxrSunPitch ? r_dxrSunPitch->value : 42.0f;
++	float yaw = r_dxrSunYaw ? r_dxrSunYaw->value : 135.0f;
++	float shadowStrength = r_dxrSunShadowStrength ? r_dxrSunShadowStrength->value : 0.65f;
++	float sr = 1.0f, sg = 0.92f, sb = 0.78f;
++
++	if (r_dxrSunColor && r_dxrSunColor->string)
++	{
++		sscanf(r_dxrSunColor->string, "%f %f %f", &sr, &sg, &sb);
++	}
++
++	float pr = DEG2RAD(pitch);
++	float yr = DEG2RAD(yaw);
++	float cp = cosf(pr);
++	float dirX = cosf(yr) * cp;
++	float dirY = sinf(yr) * cp;
++	float dirZ = sinf(pr);
++
++	glRaytracingLightingSetSun(
++		enabled,
++		dirX, dirY, dirZ,
++		sr, sg, sb,
++		intensity,
++		shadowStrength);
++}
++
+ static void RB_RunRaytracedLightingPass(void)
+ {
+ 	static int s_lastDXRDebugPrintTime = 0;
+@@ -1192,6 +1282,8 @@ static void RB_RunRaytracedLightingPass(void)
+ 		glRaytracingLightingSetDebugMode(0);
+ 	}
+ 
++	RB_ApplyDXRPerformanceSettings();
++	RB_ApplyDXRSunSettings();
+ 	RB_AddDXRFallbackLightIfNeeded();
+ 
+ 	if (r_dxrDebug && r_dxrDebug->integer)
+@@ -1201,10 +1293,16 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR: meshes=%u instances=%u lights=%u fallback=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
++				"DXR: meshes=%u instances=%u lights=%u preset=%d maxLights=%d shSamp=%d ao=%d sky=%d sun=%d fallback=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
++				r_dxrPerfPreset ? r_dxrPerfPreset->integer : 1,
++				r_dxrMaxLights ? r_dxrMaxLights->integer : 8,
++				r_dxrShadowSamples ? r_dxrShadowSamples->integer : 2,
++				r_dxrAOSamples ? r_dxrAOSamples->integer : 0,
++				r_dxrSkySamples ? r_dxrSkySamples->integer : 1,
++				r_dxrSunEnable ? r_dxrSunEnable->integer : 0,
+ 				r_dxrFallbackLight ? r_dxrFallbackLight->integer : 0,
+ 				r_dxrFallbackLightRadius ? r_dxrFallbackLightRadius->value : 0.0f,
+ 				r_dxrFallbackLightIntensity ? r_dxrFallbackLightIntensity->value : 0.0f,
+diff --git a/src/renderer/tr_cmesh.cpp b/src/renderer/tr_cmesh.cpp
+index 82b1771..6ded2a7 100644
+--- a/src/renderer/tr_cmesh.cpp
++++ b/src/renderer/tr_cmesh.cpp
+@@ -326,9 +326,18 @@ void R_AddMDCSurfaces( trRefEntity_t *ent ) {
+ 		 || ( ent->e.frame < 0 )
+ 		 || ( ent->e.oldframe >= tr.currentModel->mdc[0]->numFrames )
+ 		 || ( ent->e.oldframe < 0 ) ) {
+-		ri.Printf( PRINT_DEVELOPER, "R_AddMDCSurfaces: no such frame %d to %d for '%s'\n",
++		static int s_mdcFrameWarningCount = 0;
++		if (s_mdcFrameWarningCount < 16)
++		{
++			ri.Printf( PRINT_DEVELOPER, "R_AddMDCSurfaces: no such frame %d to %d for '%s'\n",
+ 				   ent->e.oldframe, ent->e.frame,
+ 				   tr.currentModel->name );
++		}
++		else if (s_mdcFrameWarningCount == 16)
++		{
++			ri.Printf( PRINT_DEVELOPER, "R_AddMDCSurfaces: suppressing repeated bad-frame warnings\n" );
++		}
++		++s_mdcFrameWarningCount;
+ 		ent->e.frame = 0;
+ 		ent->e.oldframe = 0;
+ 	}
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index e85310b..47947b5 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -83,6 +83,18 @@ cvar_t  *r_dxrDebugMode;
+ cvar_t  *r_dxrFallbackLight;
+ cvar_t  *r_dxrFallbackLightRadius;
+ cvar_t  *r_dxrFallbackLightIntensity;
++cvar_t  *r_dxrPerfPreset;
++cvar_t  *r_dxrMaxLights;
++cvar_t  *r_dxrShadowSamples;
++cvar_t  *r_dxrAOSamples;
++cvar_t  *r_dxrSkySamples;
++cvar_t  *r_dxrSync;
++cvar_t  *r_dxrSunEnable;
++cvar_t  *r_dxrSunIntensity;
++cvar_t  *r_dxrSunPitch;
++cvar_t  *r_dxrSunYaw;
++cvar_t  *r_dxrSunColor;
++cvar_t  *r_dxrSunShadowStrength;
+ 
+ cvar_t  *r_waterFogColor;   //----(SA)	added
+ cvar_t  *r_mapFogColor;
+@@ -1002,6 +1014,18 @@ void R_Register( void ) {
+ 	r_dxrFallbackLight = ri.Cvar_Get( "r_dxrFallbackLight", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightRadius = ri.Cvar_Get( "r_dxrFallbackLightRadius", "900", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightIntensity = ri.Cvar_Get( "r_dxrFallbackLightIntensity", "6.0", CVAR_ARCHIVE );
++	r_dxrPerfPreset = ri.Cvar_Get( "r_dxrPerfPreset", "1", CVAR_ARCHIVE );
++	r_dxrMaxLights = ri.Cvar_Get( "r_dxrMaxLights", "8", CVAR_ARCHIVE );
++	r_dxrShadowSamples = ri.Cvar_Get( "r_dxrShadowSamples", "2", CVAR_ARCHIVE );
++	r_dxrAOSamples = ri.Cvar_Get( "r_dxrAOSamples", "0", CVAR_ARCHIVE );
++	r_dxrSkySamples = ri.Cvar_Get( "r_dxrSkySamples", "1", CVAR_ARCHIVE );
++	r_dxrSync = ri.Cvar_Get( "r_dxrSync", "0", CVAR_ARCHIVE );
++	r_dxrSunEnable = ri.Cvar_Get( "r_dxrSunEnable", "0", CVAR_ARCHIVE );
++	r_dxrSunIntensity = ri.Cvar_Get( "r_dxrSunIntensity", "0.65", CVAR_ARCHIVE );
++	r_dxrSunPitch = ri.Cvar_Get( "r_dxrSunPitch", "42", CVAR_ARCHIVE );
++	r_dxrSunYaw = ri.Cvar_Get( "r_dxrSunYaw", "135", CVAR_ARCHIVE );
++	r_dxrSunColor = ri.Cvar_Get( "r_dxrSunColor", "1.0 0.92 0.78", CVAR_ARCHIVE );
++	r_dxrSunShadowStrength = ri.Cvar_Get( "r_dxrSunShadowStrength", "0.65", CVAR_ARCHIVE );
+ 	r_finish = ri.Cvar_Get( "r_finish", "0", CVAR_ARCHIVE );
+ 	r_textureMode = ri.Cvar_Get( "r_textureMode", "GL_LINEAR_MIPMAP_NEAREST", CVAR_ARCHIVE );
+ 	r_swapInterval = ri.Cvar_Get( "r_swapInterval", "0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 1816efa..94f0535 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1138,6 +1138,18 @@ extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 occlusio
+ extern cvar_t   *r_dxrFallbackLight;    // optional camera-side test light for verification
+ extern cvar_t   *r_dxrFallbackLightRadius;
+ extern cvar_t   *r_dxrFallbackLightIntensity;
++extern cvar_t   *r_dxrPerfPreset;       // 0 custom, 1 low, 2 balanced, 3 high, 4 cinematic
++extern cvar_t   *r_dxrMaxLights;        // custom light cap for perf preset 0
++extern cvar_t   *r_dxrShadowSamples;    // custom shadow samples for perf preset 0
++extern cvar_t   *r_dxrAOSamples;        // custom AO samples for perf preset 0
++extern cvar_t   *r_dxrSkySamples;       // custom sky visibility samples for perf preset 0
++extern cvar_t   *r_dxrSync;             // force synchronous DXR dispatch for debugging
++extern cvar_t   *r_dxrSunEnable;
++extern cvar_t   *r_dxrSunIntensity;
++extern cvar_t   *r_dxrSunPitch;
++extern cvar_t   *r_dxrSunYaw;
++extern cvar_t   *r_dxrSunColor;
++extern cvar_t   *r_dxrSunShadowStrength;
+ 
+ extern cvar_t  *r_norefresh;            // bypasses the ref rendering
+ extern cvar_t  *r_drawentities;         // disable/enable entity rendering
