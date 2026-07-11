@@ -1,0 +1,614 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 2575512..a625753 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -54,11 +54,14 @@ static void glRaytracingFatal(const char* fmt, ...)
+ 	Com_Printf("^1DXR ERROR:^7 %s\n", buffer);
+ }
+ 
++static int glRaytracingHandleFailure(HRESULT hr, const char* what, const char* file, int line);
++static int glRaytracingShouldAbortWork(void);
++
+ #define GLR_CHECK(x) \
+-    do { HRESULT _hr = (x); if (FAILED(_hr)) { glRaytracingFatal("HRESULT 0x%08X failed at %s:%d", (unsigned)_hr, __FILE__, __LINE__); return 0; } } while (0)
++    do { HRESULT _hr = (x); if (FAILED(_hr)) { glRaytracingHandleFailure(_hr, #x, __FILE__, __LINE__); return 0; } } while (0)
+ 
+ #define GLR_CHECKV(x) \
+-    do { HRESULT _hr = (x); if (FAILED(_hr)) { glRaytracingFatal("HRESULT 0x%08X failed at %s:%d", (unsigned)_hr, __FILE__, __LINE__); return; } } while (0)
++    do { HRESULT _hr = (x); if (FAILED(_hr)) { glRaytracingHandleFailure(_hr, #x, __FILE__, __LINE__); return; } } while (0)
+ 
+ // ============================================================
+ // Helpers
+@@ -108,6 +111,9 @@ static glRaytracingBuffer_t glRaytracingCreateBuffer(
+ {
+ 	glRaytracingBuffer_t out;
+ 
++	if (glRaytracingShouldAbortWork() || !device || size == 0)
++		return out;
++
+ 	D3D12_HEAP_PROPERTIES hp = {};
+ 	hp.Type = heapType;
+ 
+@@ -132,7 +138,7 @@ static glRaytracingBuffer_t glRaytracingCreateBuffer(
+ 
+ 	if (FAILED(hr))
+ 	{
+-		glRaytracingFatal("CreateCommittedResource failed 0x%08X", (unsigned)hr);
++		glRaytracingHandleFailure(hr, "CreateCommittedResource", __FILE__, __LINE__);
+ 		return out;
+ 	}
+ 
+@@ -141,18 +147,28 @@ static glRaytracingBuffer_t glRaytracingCreateBuffer(
+ 	return out;
+ }
+ 
+-static void glRaytracingMapCopy(ID3D12Resource* res, const void* src, size_t bytes)
++static int glRaytracingMapCopy(ID3D12Resource* res, const void* src, size_t bytes)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
++	if (!res || !src)
++		return 0;
++
++	if (bytes == 0)
++		return 1;
++
+ 	void* dst = nullptr;
+ 	HRESULT hr = res->Map(0, nullptr, &dst);
+-	if (FAILED(hr))
++	if (FAILED(hr) || !dst)
+ 	{
+-		glRaytracingFatal("Map failed 0x%08X", (unsigned)hr);
+-		return;
++		glRaytracingHandleFailure(FAILED(hr) ? hr : E_FAIL, "Map", __FILE__, __LINE__);
++		return 0;
+ 	}
+ 
+ 	memcpy(dst, src, bytes);
+ 	res->Unmap(0, nullptr);
++	return 1;
+ }
+ 
+ static void glRaytracingTransition(
+@@ -224,16 +240,123 @@ struct glRaytracingCmdContext_t
+ 
+ static glRaytracingCmdContext_t g_glRaytracingCmd;
+ 
++struct glRaytracingSafetyOptions_t
++{
++	int safeMode;
++	int noDispatch;
++	int noBuildBLAS;
++	int noBuildTLAS;
++	int errorLimit;
++};
++
++static glRaytracingSafetyOptions_t g_glRaytracingSafety = { 1, 0, 0, 0, 8 };
++static volatile LONG g_glRaytracingDeviceLost = 0;
++static HRESULT g_glRaytracingDeviceLostHr = S_OK;
++static HRESULT g_glRaytracingDeviceRemovedReason = S_OK;
++static int g_glRaytracingErrorCount = 0;
++static int g_glRaytracingNoDispatchPrinted = 0;
++static int g_glRaytracingNoBuildBLASPrinted = 0;
++static int g_glRaytracingNoBuildTLASPrinted = 0;
++
++static int glRaytracingIsDeviceRemovedLike(HRESULT hr)
++{
++	return hr == DXGI_ERROR_DEVICE_REMOVED ||
++		hr == DXGI_ERROR_DEVICE_RESET ||
++		hr == DXGI_ERROR_DEVICE_HUNG;
++}
++
++static int glRaytracingCanLogError(void)
++{
++	int limit = g_glRaytracingSafety.errorLimit;
++	if (limit < 1)
++		limit = 1;
++
++	if (g_glRaytracingErrorCount < limit)
++	{
++		++g_glRaytracingErrorCount;
++		return 1;
++	}
++	return 0;
++}
++
++static int glRaytracingHandleFailure(HRESULT hr, const char* what, const char* file, int line)
++{
++	if (glRaytracingIsDeviceRemovedLike(hr))
++	{
++		if (InterlockedCompareExchange(&g_glRaytracingDeviceLost, 1, 0) == 0)
++		{
++			g_glRaytracingDeviceLostHr = hr;
++			g_glRaytracingDeviceRemovedReason = hr;
++			if (g_glRaytracingCmd.device)
++				g_glRaytracingDeviceRemovedReason = g_glRaytracingCmd.device->GetDeviceRemovedReason();
++
++			Com_Printf(
++				"^1DXR DEVICE LOST:^7 %s failed 0x%08X at %s:%d, removedReason=0x%08X. DXR work is disabled until the renderer/device is restarted.\n",
++				what ? what : "D3D12 call",
++				(unsigned)hr,
++				file ? file : "?",
++				line,
++				(unsigned)g_glRaytracingDeviceRemovedReason);
++			OutputDebugStringA("DXR DEVICE LOST - suppressing further DXR work\n");
++		}
++		return 0;
++	}
++
++	if (glRaytracingCanLogError())
++	{
++		glRaytracingFatal(
++			"%s failed 0x%08X at %s:%d",
++			what ? what : "D3D12 call",
++			(unsigned)hr,
++			file ? file : "?",
++			line);
++	}
++	return 0;
++}
++
++static int glRaytracingShouldAbortWork(void)
++{
++	return g_glRaytracingSafety.safeMode && g_glRaytracingDeviceLost;
++}
++
++static void glRaytracingPrintSafeOnce(int* printed, const char* message)
++{
++	if (!printed || *printed)
++		return;
++	*printed = 1;
++	Com_Printf("^3DXR SAFE:^7 %s\n", message);
++}
++
+ static void glRaytracingWaitFenceValue(UINT64 value)
+ {
++	if (glRaytracingShouldAbortWork())
++		return;
++
+ 	if (!value || !g_glRaytracingCmd.fence || !g_glRaytracingCmd.fenceEvent)
+ 		return;
+ 
+ 	if (g_glRaytracingCmd.fence->GetCompletedValue() >= value)
+ 		return;
+ 
+-	g_glRaytracingCmd.fence->SetEventOnCompletion(value, g_glRaytracingCmd.fenceEvent);
+-	WaitForSingleObject(g_glRaytracingCmd.fenceEvent, INFINITE);
++	HRESULT hr = g_glRaytracingCmd.fence->SetEventOnCompletion(value, g_glRaytracingCmd.fenceEvent);
++	if (FAILED(hr))
++	{
++		glRaytracingHandleFailure(hr, "SetEventOnCompletion", __FILE__, __LINE__);
++		return;
++	}
++
++	const DWORD waitMs = g_glRaytracingSafety.safeMode ? 2000u : INFINITE;
++	DWORD waitResult = WaitForSingleObject(g_glRaytracingCmd.fenceEvent, waitMs);
++	if (waitResult == WAIT_TIMEOUT)
++	{
++		glRaytracingHandleFailure(DXGI_ERROR_DEVICE_HUNG, "Fence wait timeout", __FILE__, __LINE__);
++		return;
++	}
++	if (waitResult != WAIT_OBJECT_0)
++	{
++		glRaytracingHandleFailure(E_FAIL, "Fence wait failed", __FILE__, __LINE__);
++		return;
++	}
+ }
+ 
+ static UINT64 glRaytracingSignalQueue(void)
+@@ -354,7 +477,12 @@ static void glRaytracingShutdownCmdContext(void)
+ 
+ static int glRaytracingBeginCmd(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	glRaytracingWaitFenceValue(g_glRaytracingCmd.cmdLastFenceValue);
++	if (glRaytracingShouldAbortWork())
++		return 0;
+ 
+ 	GLR_CHECK(g_glRaytracingCmd.cmdAlloc->Reset());
+ 	GLR_CHECK(g_glRaytracingCmd.cmdList->Reset(g_glRaytracingCmd.cmdAlloc.Get(), nullptr));
+@@ -375,7 +503,12 @@ static int glRaytracingEndCmd(void)
+ 
+ static int glRaytracingBeginBlasCmd(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	glRaytracingWaitFenceValue(g_glRaytracingCmd.blasLastFenceValue);
++	if (glRaytracingShouldAbortWork())
++		return 0;
+ 
+ 	GLR_CHECK(g_glRaytracingCmd.blasCmdAlloc->Reset());
+ 	GLR_CHECK(g_glRaytracingCmd.blasCmdList->Reset(g_glRaytracingCmd.blasCmdAlloc.Get(), nullptr));
+@@ -395,7 +528,12 @@ static UINT64 glRaytracingEndBlasCmd(void)
+ 
+ static int glRaytracingBeginTlasCmd(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	glRaytracingWaitFenceValue(g_glRaytracingCmd.tlasLastFenceValue);
++	if (glRaytracingShouldAbortWork())
++		return 0;
+ 
+ 	GLR_CHECK(g_glRaytracingCmd.tlasCmdAlloc->Reset());
+ 	GLR_CHECK(g_glRaytracingCmd.tlasCmdList->Reset(g_glRaytracingCmd.tlasCmdAlloc.Get(), nullptr));
+@@ -893,6 +1031,15 @@ static int glRaytracingUploadMeshBuffers(glRaytracingMeshRecord_t* mesh);
+ 
+ static int glRaytracingBuildDirtyMeshesInternal(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
++	if (g_glRaytracingSafety.noBuildBLAS)
++	{
++		glRaytracingPrintSafeOnce(&g_glRaytracingNoBuildBLASPrinted, "r_dxrNoBuildBLAS is 1; skipping BLAS build. This tests whether BLAS/resource creation is the hang point.");
++		return 0;
++	}
++
+ 	std::vector<glRaytracingMeshRecord_t*> dirtyMeshes;
+ 	dirtyMeshes.reserve(g_glRaytracingScene.meshes.size());
+ 
+@@ -993,6 +1140,9 @@ static int glRaytracingBuildDirtyMeshesInternal(void)
+ 
+ 	for (size_t i = 0; i < builds.size(); ++i)
+ 	{
++		if (glRaytracingShouldAbortWork())
++			return 0;
++
+ 		g_glRaytracingCmd.blasCmdList->BuildRaytracingAccelerationStructure(&builds[i].buildDesc, 0, nullptr);
+ 
+ 		D3D12_RESOURCE_BARRIER uav = {};
+@@ -1048,8 +1198,10 @@ static int glRaytracingUploadMeshBuffers(glRaytracingMeshRecord_t* mesh)
+ 	if (!mesh->vertexBuffer.resource || !mesh->indexBuffer.resource)
+ 		return 0;
+ 
+-	glRaytracingMapCopy(mesh->vertexBuffer.resource.Get(), mesh->verticesCpu.data(), (size_t)vbBytes);
+-	glRaytracingMapCopy(mesh->indexBuffer.resource.Get(), mesh->indicesCpu.data(), (size_t)ibBytes);
++	if (!glRaytracingMapCopy(mesh->vertexBuffer.resource.Get(), mesh->verticesCpu.data(), (size_t)vbBytes))
++		return 0;
++	if (!glRaytracingMapCopy(mesh->indexBuffer.resource.Get(), mesh->indicesCpu.data(), (size_t)ibBytes))
++		return 0;
+ 
+ 	return 1;
+ }
+@@ -1104,8 +1256,10 @@ static int glRaytracingEnsureSceneUploadBuffer(UINT64 requiredBytes)
+ 
+ 	void* mapped = nullptr;
+ 	D3D12_RANGE readRange = {};
+-	if (FAILED(upload->buffer.resource->Map(0, &readRange, &mapped)) || !mapped)
++	HRESULT mapHr = upload->buffer.resource->Map(0, &readRange, &mapped);
++	if (FAILED(mapHr) || !mapped)
+ 	{
++		glRaytracingHandleFailure(FAILED(mapHr) ? mapHr : E_FAIL, "Map instance upload", __FILE__, __LINE__);
+ 		upload->buffer.resource.Reset();
+ 		return 0;
+ 	}
+@@ -1123,6 +1277,15 @@ struct glRaytracingResolvedInstance_t
+ 
+ static int glRaytracingBuildSceneInternal(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
++	if (g_glRaytracingSafety.noBuildTLAS)
++	{
++		glRaytracingPrintSafeOnce(&g_glRaytracingNoBuildTLASPrinted, "r_dxrNoBuildTLAS is 1; BLAS may build, but TLAS and DispatchRays are skipped. This isolates TLAS/dispatch issues.");
++		return 0;
++	}
++
+ 	UINT aliveCount = 0;
+ 	int anyDirty = 0;
+ 	int needsRebuild = g_glRaytracingScene.tlasNeedsRebuild;
+@@ -1230,6 +1393,9 @@ static int glRaytracingBuildSceneInternal(void)
+ 		buildDesc.SourceAccelerationStructureData = srcTLAS->gpuVA;
+ 	}
+ 
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	g_glRaytracingCmd.tlasCmdList->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
+ 
+ 	D3D12_RESOURCE_BARRIER uav = {};
+@@ -1477,6 +1643,9 @@ void glRaytracingDeleteInstance(glRaytracingInstanceHandle_t instanceHandle)
+ 
+ int glRaytracingBuildMesh(glRaytracingMeshHandle_t meshHandle)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	if (!g_glRaytracingScene.initialized)
+ 		return 0;
+ 
+@@ -1489,6 +1658,9 @@ int glRaytracingBuildMesh(glRaytracingMeshHandle_t meshHandle)
+ 
+ int glRaytracingBuildAllMeshes(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	if (!g_glRaytracingScene.initialized)
+ 		return 0;
+ 
+@@ -1497,6 +1669,9 @@ int glRaytracingBuildAllMeshes(void)
+ 
+ int glRaytracingBuildScene(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	if (!g_glRaytracingScene.initialized)
+ 		return 0;
+ 
+@@ -1533,6 +1708,20 @@ uint32_t glRaytracingGetInstanceCount(void)
+ 	return count;
+ }
+ 
++int glRaytracingHasDeviceLost(void)
++{
++	return g_glRaytracingDeviceLost ? 1 : 0;
++}
++
++void glRaytracingSetSafetyOptions(int safeMode, int noDispatch, int noBuildBLAS, int noBuildTLAS, int errorLimit)
++{
++	g_glRaytracingSafety.safeMode = safeMode ? 1 : 0;
++	g_glRaytracingSafety.noDispatch = noDispatch ? 1 : 0;
++	g_glRaytracingSafety.noBuildBLAS = noBuildBLAS ? 1 : 0;
++	g_glRaytracingSafety.noBuildTLAS = noBuildTLAS ? 1 : 0;
++	g_glRaytracingSafety.errorLimit = glRaytracingClamp<int>(errorLimit, 1, 64);
++}
++
+ // ============================================================
+ // Lighting state
+ // ============================================================
+@@ -2639,15 +2828,18 @@ static int glRaytracingLightingCreateShaderTables(void)
+ 
+ 	memset(temp, 0, sizeof(temp));
+ 	memcpy(temp, raygenId, shaderIdSize);
+-	glRaytracingMapCopy(g_glRaytracingLighting.raygenTable.resource.Get(), temp, recordSize);
++	if (!glRaytracingMapCopy(g_glRaytracingLighting.raygenTable.resource.Get(), temp, recordSize))
++		return 0;
+ 
+ 	memset(temp, 0, sizeof(temp));
+ 	memcpy(temp, missId, shaderIdSize);
+-	glRaytracingMapCopy(g_glRaytracingLighting.missTable.resource.Get(), temp, recordSize);
++	if (!glRaytracingMapCopy(g_glRaytracingLighting.missTable.resource.Get(), temp, recordSize))
++		return 0;
+ 
+ 	memset(temp, 0, sizeof(temp));
+ 	memcpy(temp, hitId, shaderIdSize);
+-	glRaytracingMapCopy(g_glRaytracingLighting.hitTable.resource.Get(), temp, recordSize);
++	if (!glRaytracingMapCopy(g_glRaytracingLighting.hitTable.resource.Get(), temp, recordSize))
++		return 0;
+ 
+ 	return 1;
+ }
+@@ -2955,6 +3147,9 @@ void glRaytracingLightingSetSun(int enabled, float dirX, float dirY, float dirZ,
+ 
+ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ {
++	if (glRaytracingShouldAbortWork())
++		return false;
++
+ 	if (!g_glRaytracingLighting.initialized || !pass)
+ 		return false;
+ 
+@@ -2985,6 +3180,15 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	glRaytracingLightingUpdateConstants();
+ 	glRaytracingLightingCreatePerPassDescriptors(pass);
+ 
++	if (glRaytracingShouldAbortWork())
++		return false;
++
++	if (g_glRaytracingSafety.noDispatch)
++	{
++		glRaytracingPrintSafeOnce(&g_glRaytracingNoDispatchPrinted, "r_dxrNoDispatch is 1; descriptors are prepared but DispatchRays is skipped. This isolates shader/dispatch issues.");
++		return false;
++	}
++
+ 	if (!glRaytracingBeginCmd())
+ 		return false;
+ 
+@@ -3033,6 +3237,9 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	rays.Height = pass->height;
+ 	rays.Depth = 1;
+ 
++	if (glRaytracingShouldAbortWork())
++		return false;
++
+ 	g_glRaytracingCmd.cmdList->DispatchRays(&rays);
+ 
+ 	D3D12_RESOURCE_BARRIER uav = {};
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index 7644210..d26cfdb 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1691,6 +1691,8 @@ int                        glRaytracingBuildSceneIfDirty(void);
+ 
+ uint32_t                   glRaytracingGetMeshCount(void);
+ uint32_t                   glRaytracingGetInstanceCount(void);
++int                        glRaytracingHasDeviceLost(void);
++void                       glRaytracingSetSafetyOptions(int safeMode, int noDispatch, int noBuildBLAS, int noBuildTLAS, int errorLimit);
+ 
+ bool                       glRaytracingLightingInit(void);
+ void                       glRaytracingLightingShutdown(void);
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index 1d4c97d..95f486d 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1095,6 +1095,16 @@ void RB_UpdateDrawSurfFlags(drawSurf_t* surf, shader_t *shader)
+ 
+ static qboolean RB_DXRShouldRenderLighting(void)
+ {
++	if (glRaytracingHasDeviceLost())
++	{
++		if (r_dxr && r_dxr->integer)
++		{
++			ri.Printf(PRINT_ALL, "DXR SAFE: D3D12 device was lost; forcing r_dxr 0 to avoid a hang. Restart renderer/game before testing DXR again.\n");
++			ri.Cvar_Set("r_dxr", "0");
++		}
++		return qfalse;
++	}
++
+ 	if (r_dxr && !r_dxr->integer)
+ 	{
+ 		return qfalse;
+@@ -1140,6 +1150,16 @@ static void RB_AddDXRFallbackLightIfNeeded(void)
+ 	glRaytracingLightingAddLight(&light);
+ }
+ 
++static void RB_ApplyDXRSafetySettings(void)
++{
++	glRaytracingSetSafetyOptions(
++		r_dxrSafeMode ? r_dxrSafeMode->integer : 1,
++		r_dxrNoDispatch ? r_dxrNoDispatch->integer : 0,
++		r_dxrNoBuildBLAS ? r_dxrNoBuildBLAS->integer : 0,
++		r_dxrNoBuildTLAS ? r_dxrNoBuildTLAS->integer : 0,
++		r_dxrErrorLimit ? r_dxrErrorLimit->integer : 8);
++}
++
+ static void RB_ApplyDXRPerformanceSettings(void)
+ {
+ 	int preset = r_dxrPerfPreset ? r_dxrPerfPreset->integer : 1;
+@@ -1241,6 +1261,8 @@ static void RB_RunRaytracedLightingPass(void)
+ 
+ 	backEnd.raytraceRendered = qtrue;
+ 
++	RB_ApplyDXRSafetySettings();
++
+ 	if (r_dxrShadowBias)
+ 	{
+ 		glRaytracingLightingSetShadowBias(r_dxrShadowBias->value);
+@@ -1293,7 +1315,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR: meshes=%u instances=%u lights=%u preset=%d maxLights=%d shSamp=%d ao=%d sky=%d sun=%d fallback=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
++				"DXR: meshes=%u instances=%u lights=%u preset=%d maxLights=%d shSamp=%d ao=%d sky=%d sun=%d fallback=%d safe=%d noBLAS=%d noTLAS=%d noDispatch=%d maxWorld=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
+@@ -1304,6 +1326,11 @@ static void RB_RunRaytracedLightingPass(void)
+ 				r_dxrSkySamples ? r_dxrSkySamples->integer : 1,
+ 				r_dxrSunEnable ? r_dxrSunEnable->integer : 0,
+ 				r_dxrFallbackLight ? r_dxrFallbackLight->integer : 0,
++				r_dxrSafeMode ? r_dxrSafeMode->integer : 1,
++				r_dxrNoBuildBLAS ? r_dxrNoBuildBLAS->integer : 0,
++				r_dxrNoBuildTLAS ? r_dxrNoBuildTLAS->integer : 0,
++				r_dxrNoDispatch ? r_dxrNoDispatch->integer : 0,
++				r_dxrMaxWorldMeshes ? r_dxrMaxWorldMeshes->integer : 0,
+ 				r_dxrFallbackLightRadius ? r_dxrFallbackLightRadius->value : 0.0f,
+ 				r_dxrFallbackLightIntensity ? r_dxrFallbackLightIntensity->value : 0.0f,
+ 				r_dxrShadowBias ? r_dxrShadowBias->value : 0.0f,
+diff --git a/src/renderer/tr_bsp.cpp b/src/renderer/tr_bsp.cpp
+index de497a2..75f90f1 100644
+--- a/src/renderer/tr_bsp.cpp
++++ b/src/renderer/tr_bsp.cpp
+@@ -2439,7 +2439,15 @@ static void R_CreateRaytracingWorldMeshes(void) {
+ 
+ 	memset(s_bspRtMeshes, 0, sizeof(bspRaytracingMesh_t) * s_worldData.numsurfaces);
+ 
++	const int maxWorldMeshes = (r_dxrMaxWorldMeshes && r_dxrMaxWorldMeshes->integer > 0)
++		? r_dxrMaxWorldMeshes->integer
++		: 0;
++
+ 	for (i = 0; i < s_worldData.numsurfaces; ++i) {
++		if (maxWorldMeshes > 0 && count >= maxWorldMeshes) {
++			break;
++		}
++
+ 		msurface_t* surf = &s_worldData.surfaces[i];
+ 		surfaceType_t* data = s_worldData.surfaces[i].data;
+ 		glRaytracingMeshHandle_t mesh = 0;
+@@ -2505,7 +2513,12 @@ static void R_CreateRaytracingWorldMeshes(void) {
+ 
+ 	s_numBspRtMeshes = count;
+ 
+-	ri.Printf(PRINT_ALL, "...created %d ray tracing meshes from BSP world\n", s_numBspRtMeshes);
++	if (maxWorldMeshes > 0 && s_worldData.numsurfaces > maxWorldMeshes) {
++		ri.Printf(PRINT_ALL, "...created %d ray tracing meshes from BSP world, capped by r_dxrMaxWorldMeshes %d\n", s_numBspRtMeshes, maxWorldMeshes);
++	}
++	else {
++		ri.Printf(PRINT_ALL, "...created %d ray tracing meshes from BSP world\n", s_numBspRtMeshes);
++	}
+ }
+ 
+ /*
+@@ -2614,9 +2627,17 @@ void RE_LoadWorldMap( const char *name ) {
+ 	R_LoadLightGrid( &header->lumps[LUMP_LIGHTGRID] );
+ 	ri.Cmd_ExecuteText( EXEC_NOW, "updatescreen\n" );
+ 
++	glRaytracingSetSafetyOptions(
++		r_dxrSafeMode ? r_dxrSafeMode->integer : 1,
++		r_dxrNoDispatch ? r_dxrNoDispatch->integer : 0,
++		r_dxrNoBuildBLAS ? r_dxrNoBuildBLAS->integer : 0,
++		r_dxrNoBuildTLAS ? r_dxrNoBuildTLAS->integer : 0,
++		r_dxrErrorLimit ? r_dxrErrorLimit->integer : 8);
+ 	glRaytracingClear();
+ 	R_CreateRaytracingWorldMeshes();
+-	glRaytracingBuildScene();
++	if (r_dxr && r_dxr->integer) {
++		glRaytracingBuildScene();
++	}
+ 
+ 	s_worldData.dataSize = (byte *)ri.Hunk_Alloc( 0, h_low ) - startMarker;
+ 
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 47947b5..a7130a5 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -95,6 +95,12 @@ cvar_t  *r_dxrSunPitch;
+ cvar_t  *r_dxrSunYaw;
+ cvar_t  *r_dxrSunColor;
+ cvar_t  *r_dxrSunShadowStrength;
++cvar_t  *r_dxrSafeMode;
++cvar_t  *r_dxrNoDispatch;
++cvar_t  *r_dxrNoBuildBLAS;
++cvar_t  *r_dxrNoBuildTLAS;
++cvar_t  *r_dxrMaxWorldMeshes;
++cvar_t  *r_dxrErrorLimit;
+ 
+ cvar_t  *r_waterFogColor;   //----(SA)	added
+ cvar_t  *r_mapFogColor;
+@@ -1004,7 +1010,7 @@ void R_Register( void ) {
+ 	r_dynamiclight = ri.Cvar_Get( "r_dynamiclight", "1", CVAR_ARCHIVE );
+ 	r_dlightScale = ri.Cvar_Get( "r_dlightScale", "1.0", CVAR_ARCHIVE );   //----(SA)	added
+ 	r_dlightBacks = ri.Cvar_Get( "r_dlightBacks", "1", CVAR_ARCHIVE );
+-	r_dxr = ri.Cvar_Get( "r_dxr", "1", CVAR_ARCHIVE );
++	r_dxr = ri.Cvar_Get( "r_dxr", "0", CVAR_ARCHIVE );
+ 	r_dxrShadowBias = ri.Cvar_Get( "r_dxrShadowBias", "0.05", CVAR_ARCHIVE );
+ 	r_dxrAmbientIntensity = ri.Cvar_Get( "r_dxrAmbientIntensity", "1.35", CVAR_ARCHIVE );
+ 	r_dxrLegacyBlend = ri.Cvar_Get( "r_dxrLegacyBlend", "0.65", CVAR_ARCHIVE );
+@@ -1026,6 +1032,12 @@ void R_Register( void ) {
+ 	r_dxrSunYaw = ri.Cvar_Get( "r_dxrSunYaw", "135", CVAR_ARCHIVE );
+ 	r_dxrSunColor = ri.Cvar_Get( "r_dxrSunColor", "1.0 0.92 0.78", CVAR_ARCHIVE );
+ 	r_dxrSunShadowStrength = ri.Cvar_Get( "r_dxrSunShadowStrength", "0.65", CVAR_ARCHIVE );
++	r_dxrSafeMode = ri.Cvar_Get( "r_dxrSafeMode", "1", CVAR_ARCHIVE );
++	r_dxrNoDispatch = ri.Cvar_Get( "r_dxrNoDispatch", "0", CVAR_ARCHIVE );
++	r_dxrNoBuildBLAS = ri.Cvar_Get( "r_dxrNoBuildBLAS", "0", CVAR_ARCHIVE );
++	r_dxrNoBuildTLAS = ri.Cvar_Get( "r_dxrNoBuildTLAS", "0", CVAR_ARCHIVE );
++	r_dxrMaxWorldMeshes = ri.Cvar_Get( "r_dxrMaxWorldMeshes", "0", CVAR_ARCHIVE );
++	r_dxrErrorLimit = ri.Cvar_Get( "r_dxrErrorLimit", "8", CVAR_ARCHIVE );
+ 	r_finish = ri.Cvar_Get( "r_finish", "0", CVAR_ARCHIVE );
+ 	r_textureMode = ri.Cvar_Get( "r_textureMode", "GL_LINEAR_MIPMAP_NEAREST", CVAR_ARCHIVE );
+ 	r_swapInterval = ri.Cvar_Get( "r_swapInterval", "0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 94f0535..4bfe3ee 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1150,6 +1150,12 @@ extern cvar_t   *r_dxrSunPitch;
+ extern cvar_t   *r_dxrSunYaw;
+ extern cvar_t   *r_dxrSunColor;
+ extern cvar_t   *r_dxrSunShadowStrength;
++extern cvar_t   *r_dxrSafeMode;         // disables DXR work after first D3D12 device-removed failure
++extern cvar_t   *r_dxrNoDispatch;       // diagnostic: build resources/TLAS but skip DispatchRays
++extern cvar_t   *r_dxrNoBuildBLAS;      // diagnostic: skip BLAS builds
++extern cvar_t   *r_dxrNoBuildTLAS;      // diagnostic: build BLAS only, skip TLAS/dispatch
++extern cvar_t   *r_dxrMaxWorldMeshes;   // diagnostic cap for BSP RT mesh creation, 0 = unlimited
++extern cvar_t   *r_dxrErrorLimit;       // max DXR error lines before suppressing repeated spam
+ 
+ extern cvar_t  *r_norefresh;            // bypasses the ref rendering
+ extern cvar_t  *r_drawentities;         // disable/enable entity rendering
