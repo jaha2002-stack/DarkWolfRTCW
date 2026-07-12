@@ -1,0 +1,36 @@
+name: DarkWolf DXR TDRSafe Runtime Build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/**'
+      - 'patches/**'
+      - 'scripts/**'
+      - 'test-bats/**'
+      - '.github/workflows/darkwolf-dxr-tdrsafe-runtime-build.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Apply DXR TDR-safe runtime patches
+        shell: pwsh
+        run: ./scripts/apply-dxr-tdrsafe-runtime-full.ps1
+
+      - name: Build clean runtime release
+        shell: pwsh
+        run: ./scripts/build-windows-clean-release.ps1 -Configuration Release -Platform x64
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-DXR-TDRSafe-Runtime-Release
+          path: dist/**
+          if-no-files-found: error
