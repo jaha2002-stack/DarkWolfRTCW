@@ -1,63 +1,37 @@
-DarkWolf RTCW DXR Dispatch Guard BAT tests
-==========================================
+DarkWolf RTCW DXR Half-Resolution Full Lighting + Performance Cache tests
 
-Copy all .bat files next to WolfSP.exe.
-Run tests by double-clicking the .bat files. Close the game completely between tests.
+Copy these .bat files next to WolfSP.exe.
+Close the game completely between tests.
 
 Recommended order:
 
-1) RUN_00_SAFE_NO_DXR.bat
-   Baseline. Must be stable and high FPS.
+1. RUN_00_SAFE_NO_DXR.bat
+   Must be stable and high FPS.
 
-2) RUN_01_DXR_INIT_ONLY_NO_BLAS.bat
-   Checks DXR init only. No BLAS, no TLAS, no DispatchRays.
+2. RUN_50_HALFRES_128MESH_STABLE.bat
+   First real target. Full lighting is traced at half resolution and expanded into the full output texture.
 
-3) RUN_02_DXR_TLAS_NO_DISPATCH_128.bat
-   Builds BLAS+TLAS for up to 128 world meshes but skips DispatchRays.
-   This should be stable if the previous Safe Mode diagnosis is still correct.
+3. RUN_51_QUARTERRES_128MESH_SAFE.bat
+   Safest fallback if half-res is still slow or unstable.
 
-4) RUN_10_DISPATCH_MODE0_SKIP_128.bat
-   Uses r_dxrDispatchMode 0. Descriptors are prepared, DispatchRays skipped.
+4. RUN_52_HALFRES_512MESH.bat
+   Run if 128 meshes is stable.
 
-5) RUN_11_DISPATCH_CONSTANT_1x1.bat
-   First real DispatchRays call. Raygen writes constant magenta and does not call TraceRay.
-   If this crashes: problem is pipeline/SBT/UAV/DispatchRays itself.
+5. RUN_53_HALFRES_1024MESH.bat
+   Run if 512 meshes is stable.
 
-Then continue in this order only while the previous test is stable:
+6. RUN_54_SCALE_075_128MESH_RISKY.bat
+   Quality test. Run if half-res is stable and you want more detail.
 
-   RUN_12_DISPATCH_CONSTANT_16x16.bat
-   RUN_13_DISPATCH_CONSTANT_128x72.bat
-   RUN_14_DISPATCH_CONSTANT_FULLSCREEN.bat
+7. RUN_55_FULLRES_128MESH_DANGER.bat
+   Full-resolution danger test. Run last only; previous builds crashed here.
 
-   RUN_21_DISPATCH_GBUFFER_1x1.bat
-   RUN_22_DISPATCH_GBUFFER_128x72.bat
-   RUN_23_DISPATCH_GBUFFER_FULLSCREEN.bat
+Optional visual tests after the no-sun baseline is stable:
 
-   RUN_31_DISPATCH_MISSONLY_1x1.bat
-   RUN_32_DISPATCH_MISSONLY_128x72.bat
-   RUN_33_DISPATCH_MISSONLY_FULLSCREEN.bat
+  RUN_60_HALFRES_128MESH_WITH_SUN.bat
+  RUN_61_HALFRES_128MESH_WITH_FALLBACK.bat
 
-   RUN_41_DISPATCH_FULL_1x1.bat
-   RUN_42_DISPATCH_FULL_16x16.bat
-   RUN_43_DISPATCH_FULL_128x72.bat
-   RUN_44_DISPATCH_FULL_FULLSCREEN_128MESH.bat
-   RUN_45_DISPATCH_FULL_FULLSCREEN_512MESH.bat
+Report for each test:
+  OK / crash / hang / approximate FPS / visual notes
 
-How to interpret:
-
-- CONSTANT 1x1 fails:
-  DispatchRays/SBT/UAV/pipeline state is broken before any TraceRay.
-
-- CONSTANT works but GBUFFER fails:
-  G-buffer SRV descriptors or texture states are suspect.
-
-- GBUFFER works but MISSONLY fails:
-  TraceRay or miss shader table is suspect.
-
-- MISSONLY works but FULL fails:
-  hit group / closest-hit / actual lighting shader is suspect.
-
-- small sizes work but fullscreen fails:
-  dispatch dimensions or shader runtime cost triggers device removed.
-
-After the first crash, send rtcwconsole.log.
+After the first crash or device-removed event, send rtcwconsole.log.
