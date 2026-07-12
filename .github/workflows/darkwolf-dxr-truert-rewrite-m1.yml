@@ -1,0 +1,37 @@
+name: DarkWolf DXR TrueRT Rewrite M1
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/**'
+      - 'patches/**'
+      - 'scripts/**'
+      - 'test-bats/**'
+      - 'test-cfgs/**'
+      - '.github/workflows/darkwolf-dxr-truert-rewrite-m1.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Apply DXR TrueRT Rewrite M1 patches
+        shell: pwsh
+        run: ./scripts/apply-dxr-truert-rewrite-m1.ps1
+
+      - name: Build clean runtime release
+        shell: pwsh
+        run: ./scripts/build-windows-clean-release.ps1 -Configuration Release -Platform x64
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-DXR-TrueRT-Rewrite-M1-Release
+          path: dist/**
+          if-no-files-found: error
