@@ -1,0 +1,91 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 7a6bcbc..98eebba 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -2355,6 +2355,37 @@ float3 ComputeSpecular(float3 N, float3 V, float3 L, float3 lightColor, float li
+ 
+     return lightColor * (lightIntensity * atten * shadow * NdotL) * spec;
+ }
++
++float3 ComputeTrueRTReflectionGI(float3 worldPos, float3 N, float3 V, float3 baseAlbedo, uint2 pixel, float skyVis)
++{
++    // DXR TRUE RT M1:
++    // This is the first real ray-traced reflection/GI step.  It still uses the
++    // existing shadow hit group for stability, but it traces a real reflection
++    // ray through the TLAS and converts the result into a conservative glossy
++    // indirect/specular contribution.  Later milestones can replace this with
++    // a full material closest-hit shader and texture table.
++    float NdotV = saturate(dot(N, V));
++    float3 R = normalize(reflect(-V, N));
++
++    float roughMetalHint = saturate((max(max(baseAlbedo.r, baseAlbedo.g), baseAlbedo.b) - 0.70) * 1.65);
++    float fresnel = pow(1.0 - NdotV, 5.0);
++    float reflectStrength = saturate(0.035 + fresnel * 0.45 + roughMetalHint * 0.16);
++
++    float3 rayOrigin = worldPos + N * (gShadowBias * 2.5) + R * (gShadowBias * 2.0);
++    float missVisibility = TraceShadow(rayOrigin, R, 8192.0);
++
++    float upness = saturate(R.z * 0.5 + 0.5);
++    float3 skyCol = lerp(float3(0.18, 0.20, 0.24), float3(0.58, 0.62, 0.70), upness);
++    float3 hitCol = baseAlbedo * 0.18;
++    float3 reflCol = lerp(hitCol, skyCol * max(skyVis, 0.35), missVisibility);
++
++    // Tiny blue-noise-like dither hides low-res RT cell boundaries without
++    // changing the underlying full-resolution raster texture detail.
++    float d = Hash12((float2)pixel + worldPos.xy * 0.017 + worldPos.zz * 0.031) - 0.5;
++    reflectStrength *= 1.0 + d * 0.12;
++
++    return reflCol * reflectStrength;
++}
+ )"
+ R"(
+ void StoreRaytracedOutput(uint2 dispatchPixel, float4 color)
+@@ -2381,7 +2412,7 @@ void StoreRaytracedOutput(uint2 dispatchPixel, float4 color)
+     x1 = min(max(x1, x0 + 1u), screenW);
+     y1 = min(max(y1, y0 + 1u), screenH);
+ 
+-    // DXR FINAL HQ SMOOTH composite:
++    // DXR TRUE RT M1 smooth composite:
+     // Keep the stable low-resolution full-lighting pass, but do not write its
+     // shaded color as a hard rectangular block.  Treat the RT result as a
+     // controlled lighting multiplier for the full-resolution raster image, fade
+@@ -2400,9 +2431,9 @@ void StoreRaytracedOutput(uint2 dispatchPixel, float4 color)
+ 
+         float baseLum = max(dot(sampleBase, luma), 0.08);
+         float rtLum = max(dot(color.rgb, luma), 0.02);
+-        float lumRatio = clamp(rtLum / baseLum, 0.72, 1.32);
+-        float3 chromaRatio = clamp(rawRatio, float3(0.78, 0.78, 0.78), float3(1.28, 1.28, 1.28));
+-        float3 smoothRatio = lerp(float3(lumRatio, lumRatio, lumRatio), chromaRatio, 0.20);
++        float lumRatio = clamp(rtLum / baseLum, 0.50, 1.70);
++        float3 chromaRatio = clamp(rawRatio, float3(0.55, 0.55, 0.55), float3(1.75, 1.75, 1.75));
++        float3 smoothRatio = lerp(float3(lumRatio, lumRatio, lumRatio), chromaRatio, 0.35);
+ 
+         float invBlockW = 1.0 / max((float)(x1 - x0), 1.0);
+         float invBlockH = 1.0 / max((float)(y1 - y0), 1.0);
+@@ -2423,13 +2454,13 @@ void StoreRaytracedOutput(uint2 dispatchPixel, float4 color)
+ 
+                 // Strongest RT contribution near the center of each low-res cell,
+                 // softer at borders so adjacent cells do not form visible squares.
+-                float rtStrength = lerp(0.22, 0.68, edgeFade);
++                float rtStrength = lerp(0.45, 0.90, edgeFade);
+                 float3 finalRatio = lerp(float3(1.0, 1.0, 1.0), smoothRatio, rtStrength);
+                 float3 outColor = pxBase.rgb * finalRatio;
+ 
+                 // Avoid crushed black blocks in dark areas, but still allow contact
+                 // shadows to slightly darken corners and occluded surfaces.
+-                outColor = max(outColor, pxBase.rgb * 0.60);
++                outColor = max(outColor, pxBase.rgb * 0.35);
+                 gOutputTex[uint2(x, y)] = float4(outColor, pxBase.a);
+             }
+         }
+@@ -2654,6 +2685,10 @@ void RayGen()
+         }
+     }
+ 
++    // DXR TRUE RT M1: real TLAS reflection/GI visibility ray. This makes RT
++    // visible without enabling the old unsafe full-resolution path.
++    specularAccum += ComputeTrueRTReflectionGI(worldPos, N, V, baseAlbedo, pixel, skyVis);
++
+     lightingAccum *= ao;
+     specularAccum *= lerp(1.0, ao, 0.5);
+ 
