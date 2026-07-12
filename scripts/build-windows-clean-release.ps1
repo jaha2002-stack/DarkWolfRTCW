@@ -141,15 +141,24 @@ try {
     }
 
 
-    # Copy DXR TDR-safe Runtime test BAT files into the artifact root.
+    # Copy Playable DXR TDR-safe BAT files into the artifact root.
     $testBatDir = Join-Path $RepoRoot 'test-bats'
     if (Test-Path -LiteralPath $testBatDir) {
         Get-ChildItem -Path $testBatDir -Filter '*.bat' -File | ForEach-Object {
             Copy-Item -LiteralPath $_.FullName -Destination $dist -Force
             Write-Host "Copied test BAT $($_.Name)"
         }
-        if (Test-Path -LiteralPath (Join-Path $testBatDir 'README_TESTS_RU.txt')) {
-            Copy-Item -LiteralPath (Join-Path $testBatDir 'README_TESTS_RU.txt') -Destination (Join-Path $dist 'README_DXR_TDRSAFE_TESTS_RU.txt') -Force
+        if (Test-Path -LiteralPath (Join-Path $testBatDir 'README_PLAYABLE_PRESETS_RU.txt')) {
+            Copy-Item -LiteralPath (Join-Path $testBatDir 'README_PLAYABLE_PRESETS_RU.txt') -Destination (Join-Path $dist 'README_DXR_PLAYABLE_PRESETS_RU.txt') -Force
+        }
+    }
+
+    # Copy Playable DXR TDR-safe CFG files into dist/main so +exec works reliably.
+    $testCfgDir = Join-Path $RepoRoot 'test-cfgs'
+    if (Test-Path -LiteralPath $testCfgDir) {
+        Get-ChildItem -Path $testCfgDir -Filter '*.cfg' -File | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dist 'main') -Force
+            Write-Host "Copied preset CFG main/$($_.Name)"
         }
     }
 
@@ -157,14 +166,15 @@ try {
 @echo off
 setlocal
 cd /d "%~dp0"
-echo Starting DarkWolf RTCW DXR TDR-safe build...
-WolfSP.exe +set r_dxr 1 +set r_dxrSafeMode 1 +set r_dxrDispatchMode 4 +set r_dxrDispatchWidth 64 +set r_dxrDispatchHeight 36 +set r_dxrRenderScale 0.25 +set r_dxrMaxDispatchPixels 2304 +set r_dxrSafeFullMaxPixels 2304 +set r_dxrForceSafeFullLighting 1 +set r_dxrFreezeScene 1 +set r_dxrDispatchEveryNFrames 8 +set r_dxrCompositeBlocks 1 +set r_dxrBuildInterval 9999 +set r_dxrMaxWorldMeshes 64 +set r_dxrMaxLights 1 +set r_dxrShadowSamples 1 +set r_dxrAOSamples 0 +set r_dxrSkySamples 0 +set r_dxrFallbackLight 0 +set r_dxrSunEnable 0 +set r_dxrSync 1 +set r_dxrAmbientIntensity 1.55 +set r_dxrLegacyBlend 0.85 +set r_dxrExposure 1.25 +set r_dxrShadowBias 0.04 +spdevmap escape1
+echo Starting DarkWolf RTCW Playable DXR TDR-safe Smooth preset...
+echo Uses main\dxr_play_tdrsafe_smooth.cfg
+WolfSP.exe +exec dxr_play_tdrsafe_smooth.cfg
 '@
     Set-Content -LiteralPath (Join-Path $dist 'RUN_DARKWOLF_DXR.bat') -Value $launcher -Encoding ASCII
 
     $readme = @'
-DarkWolf RTCW DXR TDR-safe Runtime Cache release artifact
-========================================
+DarkWolf RTCW Playable DXR TDR-safe release artifact
+===============================================
 
 This artifact contains only runtime files produced by the GitHub Actions build.
 It does NOT contain original Return to Castle Wolfenstein game data/pk3 files.
@@ -175,35 +185,32 @@ Copy these files into your existing RTCW/DarkWolf game folder:
   main\cgamex64.dll          -> game main folder
   main\qagamex64.dll         -> game main folder
   main\uix64.dll             -> game main folder
+  main\dxr_*.cfg             -> game main folder
+  RUN_*.bat                  -> game root
 
-Optional: run RUN_DARKWOLF_DXR.bat after copying the files.
+Recommended launch:
 
-Recommended in-game test preset:
+  1. RUN_RESET_SAFE_NO_DXR.bat
+  2. Close the game completely.
+  3. RUN_PLAY_DXR_TDRSAFE_SMOOTH.bat
 
-  \seta r_dxr 1
-  \seta r_dxrSafeMode 1
-  \seta r_dxrDispatchMode 4
-  \seta r_dxrRenderScale 0.25
-  \seta r_dxrMaxDispatchPixels 2304
-  \seta r_dxrSafeFullMaxPixels 2304
-  \seta r_dxrForceSafeFullLighting 1
-  \seta r_dxrFreezeScene 1
-  \seta r_dxrDispatchEveryNFrames 8
-  \seta r_dxrCompositeBlocks 1
-  \seta r_dxrBuildInterval 9999
-  \seta r_dxrMaxWorldMeshes 64
-  \seta r_dxrMaxLights 1
-  \seta r_dxrShadowSamples 1
-  \seta r_dxrAOSamples 0
-  \seta r_dxrSkySamples 0
-  \seta r_dxrFallbackLight 0
-  \seta r_dxrSunEnable 0
-  \seta r_dxrAmbientIntensity 1.45
-  \seta r_dxrLegacyBlend 0.78
-  \seta r_dxrExposure 1.20
-  \seta r_dxrShadowBias 0.03
-  \vid_restart
-  \spdevmap escape1
+Preset notes:
+
+  RUN_PLAY_DXR_TDRSAFE_SMOOTH.bat
+    Main playable preset. Uses DXR mode 4 full lighting at capped 128x72 with
+    freezeScene, safe full lighting cap, and detail-preserving composite.
+
+  RUN_PLAY_DXR_TDRSAFE_FAST.bat
+    Faster 96x54 variant.
+
+  RUN_PLAY_ENHANCED_NO_RT_SHADOWS.bat
+    Smooth fallback with no full-lighting hit shader shadows.
+
+  RUN_RESET_SAFE_NO_DXR.bat
+    Safe no-DXR reset.
+
+Patch 10 changes the low-resolution full-lighting composite so it preserves
+full-resolution texture detail instead of writing large colored blocks.
 '@
     Set-Content -LiteralPath (Join-Path $dist 'README_RUN_RU.txt') -Value $readme -Encoding UTF8
 

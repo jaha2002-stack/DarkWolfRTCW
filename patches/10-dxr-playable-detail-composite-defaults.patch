@@ -1,0 +1,94 @@
+--- a/src/opengl/gl_d3d12raylight.cpp	2026-07-12 08:31:29.227671624 +0000
++++ b/src/opengl/gl_d3d12raylight.cpp	2026-07-12 08:57:23.626439417 +0000
+@@ -2381,6 +2381,43 @@
+     x1 = min(max(x1, x0 + 1u), screenW);
+     y1 = min(max(y1, y0 + 1u), screenH);
+ 
++    // Playable TDR-safe composite:
++    // The old low-resolution path wrote one full shaded color to each output block.
++    // That was stable, but visibly pixelated the entire image into large squares.
++    // For full lighting mode, preserve full-resolution raster texture detail and only
++    // reuse the low-resolution RT lighting multiplier. This keeps RT shadows/light
++    // cheap while avoiding chunky texture blocks. Diagnostic modes keep their raw
++    // colors so tests remain easy to identify.
++    if (gRaygenMode == 4u)
++    {
++        uint sx = ((dispatchPixel.x * 2u + 1u) * screenW) / (dispatchW * 2u);
++        uint sy = ((dispatchPixel.y * 2u + 1u) * screenH) / (dispatchH * 2u);
++        uint2 samplePixel = uint2(min(sx, screenW - 1u), min(sy, screenH - 1u));
++        float3 sampleBase = max(gAlbedoTex.Load(int3(samplePixel, 0)).rgb, float3(0.08, 0.08, 0.08));
++        float3 lightRatio = color.rgb / sampleBase;
++
++        // Clamp the multiplier so a single low-res RT sample cannot create huge
++        // block-to-block brightness jumps or colored squares.
++        lightRatio = clamp(lightRatio, float3(0.45, 0.45, 0.45), float3(1.85, 1.85, 1.85));
++
++        [loop]
++        for (uint y = y0; y < y1; ++y)
++        {
++            [loop]
++            for (uint x = x0; x < x1; ++x)
++            {
++                float4 pxBase = gAlbedoTex.Load(int3(uint2(x, y), 0));
++                float3 detailPreserved = pxBase.rgb * lightRatio;
++
++                // Keep most of the original per-pixel color detail. The RT result
++                // contributes the lighting/shadow term, not a blocky replacement image.
++                float3 outColor = lerp(color.rgb, detailPreserved, 0.88);
++                gOutputTex[uint2(x, y)] = float4(outColor, pxBase.a);
++            }
++        }
++        return;
++    }
++
+     [loop]
+     for (uint y = y0; y < y1; ++y)
+     {
+--- a/src/renderer/tr_init.cpp	2026-07-12 08:31:29.228083585 +0000
++++ b/src/renderer/tr_init.cpp	2026-07-12 08:57:10.460706773 +0000
+@@ -1026,19 +1026,19 @@
+ 	r_dlightBacks = ri.Cvar_Get( "r_dlightBacks", "1", CVAR_ARCHIVE );
+ 	r_dxr = ri.Cvar_Get( "r_dxr", "0", CVAR_ARCHIVE );
+ 	r_dxrShadowBias = ri.Cvar_Get( "r_dxrShadowBias", "0.05", CVAR_ARCHIVE );
+-	r_dxrAmbientIntensity = ri.Cvar_Get( "r_dxrAmbientIntensity", "1.35", CVAR_ARCHIVE );
+-	r_dxrLegacyBlend = ri.Cvar_Get( "r_dxrLegacyBlend", "0.65", CVAR_ARCHIVE );
++	r_dxrAmbientIntensity = ri.Cvar_Get( "r_dxrAmbientIntensity", "1.45", CVAR_ARCHIVE );
++	r_dxrLegacyBlend = ri.Cvar_Get( "r_dxrLegacyBlend", "0.90", CVAR_ARCHIVE );
+ 	r_dxrExposure = ri.Cvar_Get( "r_dxrExposure", "1.15", CVAR_ARCHIVE );
+ 	r_dxrDebug = ri.Cvar_Get( "r_dxrDebug", "0", CVAR_ARCHIVE );
+ 	r_dxrDebugMode = ri.Cvar_Get( "r_dxrDebugMode", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLight = ri.Cvar_Get( "r_dxrFallbackLight", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightRadius = ri.Cvar_Get( "r_dxrFallbackLightRadius", "900", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightIntensity = ri.Cvar_Get( "r_dxrFallbackLightIntensity", "6.0", CVAR_ARCHIVE );
+-	r_dxrPerfPreset = ri.Cvar_Get( "r_dxrPerfPreset", "1", CVAR_ARCHIVE );
+-	r_dxrMaxLights = ri.Cvar_Get( "r_dxrMaxLights", "8", CVAR_ARCHIVE );
+-	r_dxrShadowSamples = ri.Cvar_Get( "r_dxrShadowSamples", "2", CVAR_ARCHIVE );
++	r_dxrPerfPreset = ri.Cvar_Get( "r_dxrPerfPreset", "0", CVAR_ARCHIVE );
++	r_dxrMaxLights = ri.Cvar_Get( "r_dxrMaxLights", "1", CVAR_ARCHIVE );
++	r_dxrShadowSamples = ri.Cvar_Get( "r_dxrShadowSamples", "1", CVAR_ARCHIVE );
+ 	r_dxrAOSamples = ri.Cvar_Get( "r_dxrAOSamples", "0", CVAR_ARCHIVE );
+-	r_dxrSkySamples = ri.Cvar_Get( "r_dxrSkySamples", "1", CVAR_ARCHIVE );
++	r_dxrSkySamples = ri.Cvar_Get( "r_dxrSkySamples", "0", CVAR_ARCHIVE );
+ 	r_dxrSync = ri.Cvar_Get( "r_dxrSync", "0", CVAR_ARCHIVE );
+ 	r_dxrSunEnable = ri.Cvar_Get( "r_dxrSunEnable", "0", CVAR_ARCHIVE );
+ 	r_dxrSunIntensity = ri.Cvar_Get( "r_dxrSunIntensity", "0.65", CVAR_ARCHIVE );
+@@ -1050,14 +1050,14 @@
+ 	r_dxrNoDispatch = ri.Cvar_Get( "r_dxrNoDispatch", "0", CVAR_ARCHIVE );
+ 	r_dxrNoBuildBLAS = ri.Cvar_Get( "r_dxrNoBuildBLAS", "0", CVAR_ARCHIVE );
+ 	r_dxrNoBuildTLAS = ri.Cvar_Get( "r_dxrNoBuildTLAS", "0", CVAR_ARCHIVE );
+-	r_dxrMaxWorldMeshes = ri.Cvar_Get( "r_dxrMaxWorldMeshes", "0", CVAR_ARCHIVE );
++	r_dxrMaxWorldMeshes = ri.Cvar_Get( "r_dxrMaxWorldMeshes", "128", CVAR_ARCHIVE );
+ 	r_dxrErrorLimit = ri.Cvar_Get( "r_dxrErrorLimit", "8", CVAR_ARCHIVE );
+ 	r_dxrDispatchMode = ri.Cvar_Get( "r_dxrDispatchMode", "4", CVAR_ARCHIVE );
+-	r_dxrDispatchWidth = ri.Cvar_Get( "r_dxrDispatchWidth", "0", CVAR_ARCHIVE );
+-	r_dxrDispatchHeight = ri.Cvar_Get( "r_dxrDispatchHeight", "0", CVAR_ARCHIVE );
++	r_dxrDispatchWidth = ri.Cvar_Get( "r_dxrDispatchWidth", "128", CVAR_ARCHIVE );
++	r_dxrDispatchHeight = ri.Cvar_Get( "r_dxrDispatchHeight", "72", CVAR_ARCHIVE );
+ 	r_dxrDispatchScale = ri.Cvar_Get( "r_dxrDispatchScale", "1.0", CVAR_ARCHIVE );
+-	r_dxrRenderScale = ri.Cvar_Get( "r_dxrRenderScale", "0.50", CVAR_ARCHIVE );
+-	r_dxrMaxDispatchPixels = ri.Cvar_Get( "r_dxrMaxDispatchPixels", "240000", CVAR_ARCHIVE );
++	r_dxrRenderScale = ri.Cvar_Get( "r_dxrRenderScale", "1.0", CVAR_ARCHIVE );
++	r_dxrMaxDispatchPixels = ri.Cvar_Get( "r_dxrMaxDispatchPixels", "9216", CVAR_ARCHIVE );
+ 	r_dxrCompositeBlocks = ri.Cvar_Get( "r_dxrCompositeBlocks", "1", CVAR_ARCHIVE );
+ 	r_dxrBuildInterval = ri.Cvar_Get( "r_dxrBuildInterval", "9999", CVAR_ARCHIVE );
+ 	r_dxrFreezeScene = ri.Cvar_Get( "r_dxrFreezeScene", "1", CVAR_ARCHIVE );
