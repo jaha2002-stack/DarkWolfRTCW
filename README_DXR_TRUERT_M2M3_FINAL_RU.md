@@ -79,3 +79,8 @@ DarkWolf-DXR-TrueRT-M2M3-Final-Release
 Material Buffer в M2 — это material-lite таблица, привязанная к RT mesh/InstanceID. Она уже даёт radiance closest-hit response для отражений/GI, но это ещё не полноценный texture descriptor table со чтением всех оригинальных RTCW shader textures внутри closest-hit. Для настоящего per-triangle texture fetch понадобится отдельный M4/M5 этап: экспорт surface shader/texture IDs, bindless descriptor heap или atlas, UV/material indirection table.
 
 Но этот kit должен вернуть то, чего не хватало после TDRSafe/M1: видимые RT тени, specular, reflection/GI вклад и более похожую на ray tracing картинку.
+
+## BuildFix 14
+
+В эту версию добавлен `patches/14-dxr-m2m3-material-constant-buildfix.patch`.
+Он исправляет ошибку компиляции `GL_RAYTRACING_MAX_MATERIALS: undeclared identifier` в `gl_d3d12raylight.cpp`.

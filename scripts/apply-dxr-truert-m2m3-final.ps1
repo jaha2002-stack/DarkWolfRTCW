@@ -32,19 +32,28 @@ try {
     }
 
     if ((Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'DXR TrueRT M2/M3 Visual Restore') -and (Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'TraceRadianceMaterial')) {
-        Write-Host 'DXR TrueRT M2/M3 patch already detected; nothing to apply.'
+        if (Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'material table limit must be visible before instance descriptors') {
+            Write-Host 'DXR TrueRT M2/M3 patch and buildfix 14 already detected; nothing to apply.'
+            return
+        }
+        Write-Host 'DXR TrueRT M2/M3 patch detected; applying buildfix 14 only.'
+        $patches = @('patches/14-dxr-m2m3-material-constant-buildfix.patch')
+        foreach ($p in $patches) { Apply-Maybe $p }
+        Write-Host 'DXR TrueRT M2/M3 buildfix 14 is ready.'
         return
     }
 
     if ((Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'DXR TRUE RT M1') -and (Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'ComputeTrueRTReflectionGI')) {
         Write-Host 'Existing TrueRT Rewrite M1 stack detected; applying only patch 13.'
-        $patches = @('patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch')
+        $patches = @('patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch',
+            'patches/14-dxr-m2m3-material-constant-buildfix.patch')
     }
     elseif ((Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'DXR FINAL HQ SMOOTH') -and (Test-Contains 'src/renderer/tr_init.cpp' 'r_dxrDispatchWidth", "160')) {
         Write-Host 'Existing Final HighQuality stack detected; applying patches 12-13.'
         $patches = @(
             'patches/12-dxr-truert-reflection-gi-visible-composite.patch',
-            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch'
+            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch',
+            'patches/14-dxr-m2m3-material-constant-buildfix.patch'
         )
     }
     elseif ((Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'Playable TDR-safe composite') -and (Test-Contains 'src/renderer/tr_init.cpp' 'r_dxrLegacyBlend", "0.90')) {
@@ -52,7 +61,8 @@ try {
         $patches = @(
             'patches/11-dxr-final-hq-smooth-safe-presets.patch',
             'patches/12-dxr-truert-reflection-gi-visible-composite.patch',
-            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch'
+            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch',
+            'patches/14-dxr-m2m3-material-constant-buildfix.patch'
         )
     }
     elseif ((Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'DXR TDRSAFE') -and (Test-Contains 'src/renderer/tr_init.cpp' 'r_dxrFreezeScene')) {
@@ -61,7 +71,8 @@ try {
             'patches/10-dxr-playable-detail-composite-defaults.patch',
             'patches/11-dxr-final-hq-smooth-safe-presets.patch',
             'patches/12-dxr-truert-reflection-gi-visible-composite.patch',
-            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch'
+            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch',
+            'patches/14-dxr-m2m3-material-constant-buildfix.patch'
         )
     }
     elseif ((Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'DXR HALFRES') -and (Test-Contains 'src/renderer/tr_init.cpp' 'r_dxrRenderScale')) {
@@ -71,7 +82,8 @@ try {
             'patches/10-dxr-playable-detail-composite-defaults.patch',
             'patches/11-dxr-final-hq-smooth-safe-presets.patch',
             'patches/12-dxr-truert-reflection-gi-visible-composite.patch',
-            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch'
+            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch',
+            'patches/14-dxr-m2m3-material-constant-buildfix.patch'
         )
     }
     elseif ((Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'gRaygenMode') -and (Test-Contains 'src/renderer/tr_init.cpp' 'r_dxrDispatchMode')) {
@@ -82,7 +94,8 @@ try {
             'patches/10-dxr-playable-detail-composite-defaults.patch',
             'patches/11-dxr-final-hq-smooth-safe-presets.patch',
             'patches/12-dxr-truert-reflection-gi-visible-composite.patch',
-            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch'
+            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch',
+            'patches/14-dxr-m2m3-material-constant-buildfix.patch'
         )
     }
     elseif ((Test-Contains 'src/opengl/gl_d3d12raylight.cpp' 'glRaytracingSetSafetyOptions') -and (Test-Contains 'src/renderer/tr_init.cpp' 'r_dxrSafeMode')) {
@@ -94,7 +107,8 @@ try {
             'patches/10-dxr-playable-detail-composite-defaults.patch',
             'patches/11-dxr-final-hq-smooth-safe-presets.patch',
             'patches/12-dxr-truert-reflection-gi-visible-composite.patch',
-            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch'
+            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch',
+            'patches/14-dxr-m2m3-material-constant-buildfix.patch'
         )
     }
     else {
@@ -112,7 +126,8 @@ try {
             'patches/10-dxr-playable-detail-composite-defaults.patch',
             'patches/11-dxr-final-hq-smooth-safe-presets.patch',
             'patches/12-dxr-truert-reflection-gi-visible-composite.patch',
-            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch'
+            'patches/13-dxr-truert-m2m3-material-temporal-visual-restore.patch',
+            'patches/14-dxr-m2m3-material-constant-buildfix.patch'
         )
     }
 

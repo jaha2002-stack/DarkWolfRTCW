@@ -1,0 +1,24 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 833fe5e..d030e3f 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -82,6 +82,10 @@ static T glRaytracingClamp(T v, T lo, T hi)
+ 	return (v < lo) ? lo : ((v > hi) ? hi : v);
+ }
+ 
++// M2/M3 material table limit must be visible before instance descriptors
++// are built, because InstanceID is used as the material lookup key in DXR.
++static const uint32_t GL_RAYTRACING_MAX_MATERIALS = 8192u;
++
+ static DXGI_FORMAT glRaytracingGetSrvFormatForDepth(DXGI_FORMAT fmt)
+ {
+ 	switch (fmt)
+@@ -1888,8 +1892,6 @@ struct glRaytracingMaterial_t
+ 	float material[4];     // roughness, metallic, specular, emissive
+ };
+ 
+-static const uint32_t GL_RAYTRACING_MAX_MATERIALS = 8192;
+-
+ struct glRaytracingLightingState_t
+ {
+ 	std::vector<glRaytracingLight_t> cpuLights;
