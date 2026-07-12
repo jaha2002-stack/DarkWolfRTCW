@@ -141,19 +141,19 @@ try {
     }
 
 
-    # Copy Playable DXR TDR-safe BAT files into the artifact root.
+    # Copy Final HighQuality DXR BAT files into the artifact root.
     $testBatDir = Join-Path $RepoRoot 'test-bats'
     if (Test-Path -LiteralPath $testBatDir) {
         Get-ChildItem -Path $testBatDir -Filter '*.bat' -File | ForEach-Object {
             Copy-Item -LiteralPath $_.FullName -Destination $dist -Force
             Write-Host "Copied test BAT $($_.Name)"
         }
-        if (Test-Path -LiteralPath (Join-Path $testBatDir 'README_PLAYABLE_PRESETS_RU.txt')) {
-            Copy-Item -LiteralPath (Join-Path $testBatDir 'README_PLAYABLE_PRESETS_RU.txt') -Destination (Join-Path $dist 'README_DXR_PLAYABLE_PRESETS_RU.txt') -Force
+        if (Test-Path -LiteralPath (Join-Path $testBatDir 'README_FINAL_PRESETS_RU.txt')) {
+            Copy-Item -LiteralPath (Join-Path $testBatDir 'README_FINAL_PRESETS_RU.txt') -Destination (Join-Path $dist 'README_DXR_FINAL_PRESETS_RU.txt') -Force
         }
     }
 
-    # Copy Playable DXR TDR-safe CFG files into dist/main so +exec works reliably.
+    # Copy Final HighQuality DXR CFG files into dist/main so +exec works reliably.
     $testCfgDir = Join-Path $RepoRoot 'test-cfgs'
     if (Test-Path -LiteralPath $testCfgDir) {
         Get-ChildItem -Path $testCfgDir -Filter '*.cfg' -File | ForEach-Object {
@@ -166,14 +166,14 @@ try {
 @echo off
 setlocal
 cd /d "%~dp0"
-echo Starting DarkWolf RTCW Playable DXR TDR-safe Smooth preset...
-echo Uses main\dxr_play_tdrsafe_smooth.cfg
-WolfSP.exe +exec dxr_play_tdrsafe_smooth.cfg
+echo Starting DarkWolf RTCW Final HighQuality DXR Smooth preset...
+echo Uses main\dxr_final_high_quality.cfg
+WolfSP.exe +exec dxr_final_high_quality.cfg
 '@
     Set-Content -LiteralPath (Join-Path $dist 'RUN_DARKWOLF_DXR.bat') -Value $launcher -Encoding ASCII
 
     $readme = @'
-DarkWolf RTCW Playable DXR TDR-safe release artifact
+DarkWolf RTCW Final HighQuality DXR release artifact
 ===============================================
 
 This artifact contains only runtime files produced by the GitHub Actions build.
@@ -185,32 +185,33 @@ Copy these files into your existing RTCW/DarkWolf game folder:
   main\cgamex64.dll          -> game main folder
   main\qagamex64.dll         -> game main folder
   main\uix64.dll             -> game main folder
-  main\dxr_*.cfg             -> game main folder
+  main\dxr_final_*.cfg / main\dxr_reset_safe.cfg             -> game main folder
   RUN_*.bat                  -> game root
 
 Recommended launch:
 
-  1. RUN_RESET_SAFE_NO_DXR.bat
+  1. RUN_RESET_SAFE.bat
   2. Close the game completely.
-  3. RUN_PLAY_DXR_TDRSAFE_SMOOTH.bat
+  3. RUN_PLAY_FINAL_HIGH_QUALITY.bat
 
 Preset notes:
 
-  RUN_PLAY_DXR_TDRSAFE_SMOOTH.bat
-    Main playable preset. Uses DXR mode 4 full lighting at capped 128x72 with
-    freezeScene, safe full lighting cap, and detail-preserving composite.
+  RUN_PLAY_FINAL_HIGH_QUALITY.bat
+    Main recommended mode. Uses DXR mode 4 full lighting at capped 160x90,
+    frozen scene, safe sun/contact shadows, and final smooth composite.
 
-  RUN_PLAY_DXR_TDRSAFE_FAST.bat
-    Faster 96x54 variant.
+  RUN_PLAY_FINAL_STABLE.bat
+    Conservative 128x72 variant for maximum stability.
 
-  RUN_PLAY_ENHANCED_NO_RT_SHADOWS.bat
-    Smooth fallback with no full-lighting hit shader shadows.
+  RUN_PLAY_FINAL_EXPERIMENTAL_DXR_ULTRA.bat
+    Experimental 192x108 mode with stronger lighting. Not the main launch mode.
 
-  RUN_RESET_SAFE_NO_DXR.bat
+  RUN_RESET_SAFE.bat
     Safe no-DXR reset.
 
-Patch 10 changes the low-resolution full-lighting composite so it preserves
-full-resolution texture detail instead of writing large colored blocks.
+Patch 11 adds the final smooth composite and high-quality safe presets. It keeps
+full-resolution raster detail and uses the low-resolution DXR result as a
+soft lighting multiplier, reducing the visible pixel-square grid.
 '@
     Set-Content -LiteralPath (Join-Path $dist 'README_RUN_RU.txt') -Value $readme -Encoding UTF8
 
