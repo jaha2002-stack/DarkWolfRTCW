@@ -13,13 +13,28 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 function Convert-ToolsetToVs2022 {
-    Get-ChildItem -Path $RepoRoot -Recurse -Filter *.vcxproj | ForEach-Object {
-        $content = Get-Content -LiteralPath $_.FullName -Raw
-        $updated = $content -replace 'v145', 'v143'
-        if ($updated -ne $content) {
-            Set-Content -LiteralPath $_.FullName -Value $updated -Encoding UTF8
-            Write-Host "Converted toolset in $($_.FullName)"
+    Get-ChildItem -Path $RepoRoot -Recurse -Filter *.vcxproj |
+        Where-Object { $_.FullName -notmatch '\\src\\tools\\radiant\\' } |
+        ForEach-Object {
+            $content = Get-Content -LiteralPath $_.FullName -Raw
+            $updated = $content -replace 'v145', 'v143'
+            if ($updated -ne $content) {
+                Set-Content -LiteralPath $_.FullName -Value $updated -Encoding UTF8
+                Write-Host "Converted toolset in $($_.FullName)"
+            }
         }
+}
+
+function Disable-RadiantMfcProjectReference {
+    $wolfProject = Join-Path $RepoRoot 'src\wolf.vcxproj'
+    if (-not (Test-Path -LiteralPath $wolfProject)) { return }
+
+    $content = Get-Content -LiteralPath $wolfProject -Raw
+    $pattern = '(?s)\s*<ProjectReference Include="tools\\radiant\\Radiant\.vcxproj">.*?</ProjectReference>'
+    $updated = [regex]::Replace($content, $pattern, '')
+    if ($updated -ne $content) {
+        Set-Content -LiteralPath $wolfProject -Value $updated -Encoding UTF8
+        Write-Host 'Removed tools\radiant\Radiant.vcxproj project reference from src\wolf.vcxproj for runtime CI build.'
     }
 }
 
@@ -72,6 +87,7 @@ function Copy-IfExists {
 Push-Location $RepoRoot
 try {
     Convert-ToolsetToVs2022
+    Disable-RadiantMfcProjectReference
 
     Invoke-MSBuildProject 'src\splines\Splines.vcxproj'
     Invoke-MSBuildProject 'src\botlib\botlib.vcxproj'
