@@ -1,8 +1,9 @@
 @echo off
 cd /d "%~dp0"
-echo Stable baseline, DXR off
+echo Safe baseline: DXR forced OFF
 echo.
-echo Close the game completely before running the next test.
+echo Requires DXR TDR-safe Runtime Fix build.
+echo Close the game completely before running another DXR test.
 echo.
-WolfSP.exe +set r_dxr 0 +set r_dxrFallbackLight 0 +set r_dxrSunEnable 0 +set developer 1 +set logfile 2 +set cg_drawFPS 1 +spdevmap escape1
+WolfSP.exe +set developer 1 +set logfile 2 +set cg_drawFPS 1 +set r_dxr 0 +set r_dxrDebug 0 +set r_dxrDebugMode 0 +set r_dxrFallbackLight 0 +set r_dxrSunEnable 0 +spdevmap escape1
 pause

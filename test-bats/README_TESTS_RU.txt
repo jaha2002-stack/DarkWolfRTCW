@@ -1,37 +1,31 @@
-DarkWolf RTCW DXR Half-Resolution Full Lighting + Performance Cache tests
+DXR TDR-safe Runtime Fix BAT tests
 
-Copy these .bat files next to WolfSP.exe.
-Close the game completely between tests.
+Copy all .bat files next to WolfSP.exe.
+
+Why this kit exists:
+  Your last log showed quarter-res full lighting still reached DEVICE_HUNG:
+  DXR HALFRES: DispatchRays mode=4 size=213x120 output=853x480 scale=0.25
+  DXR DEVICE LOST: CreateCommittedResource failed 0x887A0005, removedReason=0x887A0006
+
+So this fix does NOT try larger half-res again. It makes mode 4 much safer:
+  - freezes BLAS/TLAS after the first valid TLAS
+  - caps full lighting to 64x36, 96x54, or 128x72
+  - dispatches full lighting only once every N frames
+  - optionally uses r_dxrSync 1 for safer failure detection
+  - keeps G-buffer fullscreen fallback available
 
 Recommended order:
+  1. RUN_00_SAFE_NO_DXR.bat
+  2. RUN_70_TDRSAFE_FULL_64x36_ULTRASAFE.bat
 
-1. RUN_00_SAFE_NO_DXR.bat
-   Must be stable and high FPS.
+If RUN_70 survives for a few minutes:
+  3. RUN_71_TDRSAFE_FULL_96x54_SAFE.bat
+  4. RUN_72_TDRSAFE_FULL_128x72_CAUTIOUS.bat
 
-2. RUN_50_HALFRES_128MESH_STABLE.bat
-   First real target. Full lighting is traced at half resolution and expanded into the full output texture.
+If any full-lighting mode still hangs/crashes:
+  RUN_80_TDRSAFE_GBUFFER_FULLSCREEN_STABLE.bat
 
-3. RUN_51_QUARTERRES_128MESH_SAFE.bat
-   Safest fallback if half-res is still slow or unstable.
-
-4. RUN_52_HALFRES_512MESH.bat
-   Run if 128 meshes is stable.
-
-5. RUN_53_HALFRES_1024MESH.bat
-   Run if 512 meshes is stable.
-
-6. RUN_54_SCALE_075_128MESH_RISKY.bat
-   Quality test. Run if half-res is stable and you want more detail.
-
-7. RUN_55_FULLRES_128MESH_DANGER.bat
-   Full-resolution danger test. Run last only; previous builds crashed here.
-
-Optional visual tests after the no-sun baseline is stable:
-
-  RUN_60_HALFRES_128MESH_WITH_SUN.bat
-  RUN_61_HALFRES_128MESH_WITH_FALLBACK.bat
-
-Report for each test:
-  OK / crash / hang / approximate FPS / visual notes
-
-After the first crash or device-removed event, send rtcwconsole.log.
+Interpretation:
+  RUN_70 crash/hang means the current full lighting closest-hit shader is still not safe on this GPU/driver even at very low resolution.
+  RUN_70 stable but RUN_72 crash means 128x72 is too high; keep 64x36 or 96x54.
+  RUN_80 stable means the wrapper/composition path is alive and only full lighting mode 4 must remain disabled.

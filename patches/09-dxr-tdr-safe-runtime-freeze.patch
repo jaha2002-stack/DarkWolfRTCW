@@ -1,0 +1,228 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index ea2f6cc..a033407 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -264,19 +264,27 @@ struct glRaytracingRuntimeOptions_t
+ 	float renderScale;       // preferred full-lighting scale when explicit dispatch width/height are not set
+ 	uint32_t maxDispatchPixels;
+ 	int compositeBlocks;     // 1 = low-res rays fill matching full-res output blocks
+-	int buildInterval;       // reuse a valid TLAS for N frames when possible
++	int buildInterval;       // legacy interval cap; superseded by freezeSceneAfterFirstTLAS in TDR-safe mode
+ 	uint32_t buildFrame;
++	int freezeSceneAfterFirstTLAS; // 1 = after the first valid TLAS, do not rebuild BLAS/TLAS during gameplay
++	uint32_t dispatchEveryNFrames; // 1 = every frame, 2/4/8 = reuse previous output between DXR frames
++	uint32_t dispatchFrame;
++	int forceSafeFullLighting;     // 1 = hard-cap full lighting to safe dispatch dimensions/pixels
++	uint32_t safeFullMaxPixels;    // hard cap for mode 4 regardless of archived maxDispatchPixels
+ };
+ 
+ static glRaytracingSafetyOptions_t g_glRaytracingSafety = { 1, 0, 0, 0, 8 };
+ static glRaytracingDispatchGuardOptions_t g_glRaytracingDispatchGuard = { 4, 0, 0, 1.0f, 1, 1 };
+-static glRaytracingRuntimeOptions_t g_glRaytracingRuntime = { 0.50f, 240000u, 1, 2, 0u };
++static glRaytracingRuntimeOptions_t g_glRaytracingRuntime = { 0.50f, 240000u, 1, 2, 0u, 1, 4u, 0u, 1, 9216u };
+ static volatile LONG g_glRaytracingDeviceLost = 0;
+ static HRESULT g_glRaytracingDeviceLostHr = S_OK;
+ static HRESULT g_glRaytracingDeviceRemovedReason = S_OK;
+ static int g_glRaytracingErrorCount = 0;
+ static int g_glRaytracingNoDispatchPrinted = 0;
+ static int g_glRaytracingDispatchModePrinted = 0;
++static int g_glRaytracingTdrSafePrinted = 0;
++static int g_glRaytracingFrameSkipPrinted = 0;
++static int g_glRaytracingFreezePrinted = 0;
+ static int g_glRaytracingDispatchValidationPrinted = 0;
+ static int g_glRaytracingNoBuildBLASPrinted = 0;
+ static int g_glRaytracingNoBuildTLASPrinted = 0;
+@@ -1713,7 +1721,20 @@ int glRaytracingBuildSceneCached(void)
+ 		return 0;
+ 
+ 	const glRaytracingBuffer_t* currentTLAS = glRaytracingGetCurrentTLASBufferConst();
+-	const int interval = glRaytracingClamp<int>(g_glRaytracingRuntime.buildInterval, 1, 16);
++
++	// TDR-safe runtime mode:
++	// Previous tests showed that creating/updating D3D12 resources after a full-lighting DXR frame can
++	// surface DXGI_ERROR_DEVICE_HUNG/REMOVED. The safe path builds the scene once, then freezes BLAS/TLAS
++	// for the rest of the map. This favors stability over dynamic RT geometry updates.
++	if (g_glRaytracingRuntime.freezeSceneAfterFirstTLAS &&
++		g_glRaytracingScene.tlasBuilt &&
++		currentTLAS && currentTLAS->resource && currentTLAS->gpuVA != 0)
++	{
++		glRaytracingPrintSafeOnce(&g_glRaytracingFreezePrinted, "r_dxrFreezeScene is active; reusing first valid TLAS and skipping runtime BLAS/TLAS rebuilds.");
++		return 1;
++	}
++
++	const int interval = glRaytracingClamp<int>(g_glRaytracingRuntime.buildInterval, 1, 9999);
+ 
+ 	g_glRaytracingRuntime.buildFrame++;
+ 	if (interval > 1 &&
+@@ -1790,12 +1811,17 @@ void glRaytracingSetDispatchGuardOptions(int dispatchMode, int dispatchWidth, in
+ 	g_glRaytracingDispatchGuard.validateUAV = validateUAV ? 1 : 0;
+ }
+ 
+-void glRaytracingSetRuntimeOptions(float renderScale, uint32_t maxDispatchPixels, int compositeBlocks, int buildInterval)
++void glRaytracingSetRuntimeOptions(float renderScale, uint32_t maxDispatchPixels, int compositeBlocks, int buildInterval,
++	int freezeSceneAfterFirstTLAS, uint32_t dispatchEveryNFrames, int forceSafeFullLighting, uint32_t safeFullMaxPixels)
+ {
+-	g_glRaytracingRuntime.renderScale = glRaytracingClamp<float>(renderScale, 0.10f, 1.0f);
++	g_glRaytracingRuntime.renderScale = glRaytracingClamp<float>(renderScale, 0.05f, 1.0f);
+ 	g_glRaytracingRuntime.maxDispatchPixels = maxDispatchPixels;
+ 	g_glRaytracingRuntime.compositeBlocks = compositeBlocks ? 1 : 0;
+-	g_glRaytracingRuntime.buildInterval = glRaytracingClamp<int>(buildInterval, 1, 16);
++	g_glRaytracingRuntime.buildInterval = glRaytracingClamp<int>(buildInterval, 1, 9999);
++	g_glRaytracingRuntime.freezeSceneAfterFirstTLAS = freezeSceneAfterFirstTLAS ? 1 : 0;
++	g_glRaytracingRuntime.dispatchEveryNFrames = glRaytracingClamp<uint32_t>(dispatchEveryNFrames ? dispatchEveryNFrames : 1u, 1u, 60u);
++	g_glRaytracingRuntime.forceSafeFullLighting = forceSafeFullLighting ? 1 : 0;
++	g_glRaytracingRuntime.safeFullMaxPixels = safeFullMaxPixels ? safeFullMaxPixels : 9216u;
+ }
+ 
+ // ============================================================
+@@ -3368,6 +3394,21 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 		}
+ 	}
+ 
++	// Full lighting (mode 4) is the only path that produced DEVICE_HUNG on the test machine.
++	// In TDR-safe mode it is hard-capped even if old archived cvars request a larger frame.
++	if (g_glRaytracingDispatchGuard.dispatchMode == 4 && g_glRaytracingRuntime.forceSafeFullLighting)
++	{
++		uint64_t pixels = (uint64_t)dispatchWidth * (uint64_t)dispatchHeight;
++		const uint32_t hardCap = glRaytracingClamp<uint32_t>(g_glRaytracingRuntime.safeFullMaxPixels, 256u, 65536u);
++		if (pixels > (uint64_t)hardCap)
++		{
++			const float ratio = sqrtf((float)hardCap / (float)pixels);
++			dispatchWidth = (UINT)glRaytracingClamp<int>((int)((float)dispatchWidth * ratio), 1, (int)pass->width);
++			dispatchHeight = (UINT)glRaytracingClamp<int>((int)((float)dispatchHeight * ratio), 1, (int)pass->height);
++			glRaytracingPrintSafeOnce(&g_glRaytracingTdrSafePrinted, "r_dxrForceSafeFullLighting capped mode 4 DispatchRays to TDR-safe dimensions.");
++		}
++	}
++
+ 	g_glRaytracingLighting.constants.screenSize[0] = (float)pass->width;
+ 	g_glRaytracingLighting.constants.screenSize[1] = (float)pass->height;
+ 	g_glRaytracingLighting.constants.screenSize[2] = 1.0f / (float)pass->width;
+@@ -3420,6 +3461,16 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 		return false;
+ 	}
+ 
++	if (g_glRaytracingDispatchGuard.dispatchMode == 4 && g_glRaytracingRuntime.dispatchEveryNFrames > 1)
++	{
++		g_glRaytracingRuntime.dispatchFrame++;
++		if ((g_glRaytracingRuntime.dispatchFrame % g_glRaytracingRuntime.dispatchEveryNFrames) != 1)
++		{
++			glRaytracingPrintSafeOnce(&g_glRaytracingFrameSkipPrinted, "r_dxrDispatchEveryNFrames is active; reusing previous DXR output on skipped frames.");
++			return true;
++		}
++	}
++
+ 	if (!glRaytracingBeginCmd())
+ 		return false;
+ 
+@@ -3474,13 +3525,15 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	if (!g_glRaytracingDispatchModePrinted)
+ 	{
+ 		g_glRaytracingDispatchModePrinted = 1;
+-		Com_Printf("^3DXR HALFRES:^7 DispatchRays mode=%d size=%ux%u output=%ux%u scale=%.2f maxPix=%u buildInt=%d composite=%d safe=%d.\n",
++		Com_Printf("^3DXR TDRSAFE:^7 DispatchRays mode=%d size=%ux%u output=%ux%u scale=%.2f maxPix=%u hardCap=%u everyN=%u freeze=%d composite=%d safe=%d.\n",
+ 			g_glRaytracingDispatchGuard.dispatchMode,
+ 			dispatchWidth, dispatchHeight,
+ 			pass->width, pass->height,
+ 			g_glRaytracingRuntime.renderScale,
+ 			g_glRaytracingRuntime.maxDispatchPixels,
+-			g_glRaytracingRuntime.buildInterval,
++			g_glRaytracingRuntime.safeFullMaxPixels,
++			g_glRaytracingRuntime.dispatchEveryNFrames,
++			g_glRaytracingRuntime.freezeSceneAfterFirstTLAS,
+ 			g_glRaytracingRuntime.compositeBlocks,
+ 			g_glRaytracingSafety.safeMode);
+ 	}
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index 9d79a00..800ba4e 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1695,7 +1695,7 @@ int                        glRaytracingHasDeviceLost(void);
+ int                        glRaytracingHandleExternalD3D12Failure(HRESULT hr, const char* what, const char* file, int line);
+ void                       glRaytracingSetSafetyOptions(int safeMode, int noDispatch, int noBuildBLAS, int noBuildTLAS, int errorLimit);
+ void                       glRaytracingSetDispatchGuardOptions(int dispatchMode, int dispatchWidth, int dispatchHeight, float dispatchScale, int validateSBT, int validateUAV);
+-void                       glRaytracingSetRuntimeOptions(float renderScale, uint32_t maxDispatchPixels, int compositeBlocks, int buildInterval);
++void                       glRaytracingSetRuntimeOptions(float renderScale, uint32_t maxDispatchPixels, int compositeBlocks, int buildInterval, int freezeSceneAfterFirstTLAS, uint32_t dispatchEveryNFrames, int forceSafeFullLighting, uint32_t safeFullMaxPixels);
+ int                        glRaytracingBuildSceneCached(void);
+ 
+ bool                       glRaytracingLightingInit(void);
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index 6d6b5ef..e67c5ef 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1169,7 +1169,11 @@ static void RB_ApplyDXRSafetySettings(void)
+ 		r_dxrRenderScale ? r_dxrRenderScale->value : 0.50f,
+ 		r_dxrMaxDispatchPixels ? r_dxrMaxDispatchPixels->integer : 240000,
+ 		r_dxrCompositeBlocks ? r_dxrCompositeBlocks->integer : 1,
+-		r_dxrBuildInterval ? r_dxrBuildInterval->integer : 2);
++		r_dxrBuildInterval ? r_dxrBuildInterval->integer : 9999,
++		r_dxrFreezeScene ? r_dxrFreezeScene->integer : 1,
++		r_dxrDispatchEveryNFrames ? r_dxrDispatchEveryNFrames->integer : 4,
++		r_dxrForceSafeFullLighting ? r_dxrForceSafeFullLighting->integer : 1,
++		r_dxrSafeFullMaxPixels ? r_dxrSafeFullMaxPixels->integer : 9216);
+ }
+ 
+ static void RB_ApplyDXRPerformanceSettings(void)
+@@ -1327,7 +1331,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR: meshes=%u instances=%u lights=%u preset=%d maxLights=%d shSamp=%d ao=%d sky=%d sun=%d fallback=%d safe=%d noBLAS=%d noTLAS=%d noDispatch=%d maxWorld=%d scale=%.2f maxPix=%d buildInt=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
++				"DXR: meshes=%u instances=%u lights=%u preset=%d maxLights=%d shSamp=%d ao=%d sky=%d sun=%d fallback=%d safe=%d noBLAS=%d noTLAS=%d noDispatch=%d maxWorld=%d scale=%.2f maxPix=%d buildInt=%d freeze=%d everyN=%d hardCap=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
+@@ -1345,7 +1349,10 @@ static void RB_RunRaytracedLightingPass(void)
+ 				r_dxrMaxWorldMeshes ? r_dxrMaxWorldMeshes->integer : 0,
+ 				r_dxrRenderScale ? r_dxrRenderScale->value : 0.50f,
+ 				r_dxrMaxDispatchPixels ? r_dxrMaxDispatchPixels->integer : 240000,
+-				r_dxrBuildInterval ? r_dxrBuildInterval->integer : 2,
++				r_dxrBuildInterval ? r_dxrBuildInterval->integer : 9999,
++				r_dxrFreezeScene ? r_dxrFreezeScene->integer : 1,
++				r_dxrDispatchEveryNFrames ? r_dxrDispatchEveryNFrames->integer : 4,
++				r_dxrSafeFullMaxPixels ? r_dxrSafeFullMaxPixels->integer : 9216,
+ 				r_dxrFallbackLightRadius ? r_dxrFallbackLightRadius->value : 0.0f,
+ 				r_dxrFallbackLightIntensity ? r_dxrFallbackLightIntensity->value : 0.0f,
+ 				r_dxrShadowBias ? r_dxrShadowBias->value : 0.0f,
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index dd133a5..066d307 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -109,6 +109,10 @@ cvar_t  *r_dxrRenderScale;
+ cvar_t  *r_dxrMaxDispatchPixels;
+ cvar_t  *r_dxrCompositeBlocks;
+ cvar_t  *r_dxrBuildInterval;
++cvar_t  *r_dxrFreezeScene;
++cvar_t  *r_dxrDispatchEveryNFrames;
++cvar_t  *r_dxrForceSafeFullLighting;
++cvar_t  *r_dxrSafeFullMaxPixels;
+ cvar_t  *r_dxrValidateSBT;
+ cvar_t  *r_dxrValidateUAV;
+ 
+@@ -1055,7 +1059,11 @@ void R_Register( void ) {
+ 	r_dxrRenderScale = ri.Cvar_Get( "r_dxrRenderScale", "0.50", CVAR_ARCHIVE );
+ 	r_dxrMaxDispatchPixels = ri.Cvar_Get( "r_dxrMaxDispatchPixels", "240000", CVAR_ARCHIVE );
+ 	r_dxrCompositeBlocks = ri.Cvar_Get( "r_dxrCompositeBlocks", "1", CVAR_ARCHIVE );
+-	r_dxrBuildInterval = ri.Cvar_Get( "r_dxrBuildInterval", "2", CVAR_ARCHIVE );
++	r_dxrBuildInterval = ri.Cvar_Get( "r_dxrBuildInterval", "9999", CVAR_ARCHIVE );
++	r_dxrFreezeScene = ri.Cvar_Get( "r_dxrFreezeScene", "1", CVAR_ARCHIVE );
++	r_dxrDispatchEveryNFrames = ri.Cvar_Get( "r_dxrDispatchEveryNFrames", "4", CVAR_ARCHIVE );
++	r_dxrForceSafeFullLighting = ri.Cvar_Get( "r_dxrForceSafeFullLighting", "1", CVAR_ARCHIVE );
++	r_dxrSafeFullMaxPixels = ri.Cvar_Get( "r_dxrSafeFullMaxPixels", "9216", CVAR_ARCHIVE );
+ 	r_dxrValidateSBT = ri.Cvar_Get( "r_dxrValidateSBT", "1", CVAR_ARCHIVE );
+ 	r_dxrValidateUAV = ri.Cvar_Get( "r_dxrValidateUAV", "1", CVAR_ARCHIVE );
+ 	r_finish = ri.Cvar_Get( "r_finish", "0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index c2d19e3..3ae66e8 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1164,6 +1164,10 @@ extern cvar_t   *r_dxrRenderScale;      // full lighting internal scale; 0.25 qu
+ extern cvar_t   *r_dxrMaxDispatchPixels;// safety cap for full lighting DispatchRays pixel count
+ extern cvar_t   *r_dxrCompositeBlocks;  // fill full output from low-resolution DXR rays
+ extern cvar_t   *r_dxrBuildInterval;    // reuse cached TLAS/BLAS for N frames when possible
++extern cvar_t   *r_dxrFreezeScene;      // TDR-safe mode: build first TLAS then skip runtime BLAS/TLAS rebuilds
++extern cvar_t   *r_dxrDispatchEveryNFrames; // TDR-safe mode: dispatch full lighting once every N frames
++extern cvar_t   *r_dxrForceSafeFullLighting; // hard-cap mode 4 dispatch dimensions
++extern cvar_t   *r_dxrSafeFullMaxPixels; // hard pixel cap for full lighting mode
+ extern cvar_t   *r_dxrValidateSBT;      // validate shader binding tables before DispatchRays
+ extern cvar_t   *r_dxrValidateUAV;      // validate output UAV before DispatchRays
+ 
