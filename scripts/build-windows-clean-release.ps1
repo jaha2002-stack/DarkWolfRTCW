@@ -103,7 +103,6 @@ try {
     New-Item -ItemType Directory -Path $dist | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $dist 'main') | Out-Null
 
-    # Main executable. The x64 Release target usually writes to repo root/WolfSP.exe.
     foreach ($candidate in @(
         'WolfSP.exe',
         'WolfSP_d.exe',
@@ -115,7 +114,6 @@ try {
         Copy-IfExists (Join-Path $RepoRoot $candidate) $dist
     }
 
-    # Game VM DLLs produced by the x64 projects.
     foreach ($pattern in @('cgamex64*.dll', 'qagamex64*.dll', 'uix64*.dll')) {
         Get-ChildItem -Path (Join-Path $RepoRoot 'main') -Filter $pattern -File -ErrorAction SilentlyContinue | ForEach-Object {
             Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dist 'main') -Force
@@ -123,99 +121,54 @@ try {
         }
     }
 
-    # Optional runtime DLLs if present in the repository.
-    foreach ($pattern in @(
-        'OpenAL32.dll',
-        'dxcompiler.dll',
-        'dxil.dll',
-        'D3D12Core.dll',
-        'd3d12SDKLayers.dll',
-        'NvLowLatencyVk.dll',
-        'nvngx_*.dll',
-        'sl.*.dll'
-    )) {
+    foreach ($pattern in @('OpenAL32.dll','dxcompiler.dll','dxil.dll','D3D12Core.dll','d3d12SDKLayers.dll')) {
         Get-ChildItem -Path $RepoRoot -Filter $pattern -File -ErrorAction SilentlyContinue | ForEach-Object {
             Copy-Item -LiteralPath $_.FullName -Destination $dist -Force
             Write-Host "Copied $($_.Name)"
         }
     }
 
-
-    # Copy Final HighQuality DXR BAT files into the artifact root.
-    $testBatDir = Join-Path $RepoRoot 'test-bats'
-    if (Test-Path -LiteralPath $testBatDir) {
-        Get-ChildItem -Path $testBatDir -Filter '*.bat' -File | ForEach-Object {
+    $batDir = Join-Path $RepoRoot 'test-bats'
+    if (Test-Path -LiteralPath $batDir) {
+        Get-ChildItem -Path $batDir -Filter '*.bat' -File | ForEach-Object {
             Copy-Item -LiteralPath $_.FullName -Destination $dist -Force
-            Write-Host "Copied test BAT $($_.Name)"
+            Write-Host "Copied BAT $($_.Name)"
         }
-        if (Test-Path -LiteralPath (Join-Path $testBatDir 'README_FINAL_PRESETS_RU.txt')) {
-            Copy-Item -LiteralPath (Join-Path $testBatDir 'README_FINAL_PRESETS_RU.txt') -Destination (Join-Path $dist 'README_DXR_FINAL_PRESETS_RU.txt') -Force
-        }
-    }
-
-    # Copy Final HighQuality DXR CFG files into dist/main so +exec works reliably.
-    $testCfgDir = Join-Path $RepoRoot 'test-cfgs'
-    if (Test-Path -LiteralPath $testCfgDir) {
-        Get-ChildItem -Path $testCfgDir -Filter '*.cfg' -File | ForEach-Object {
-            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dist 'main') -Force
-            Write-Host "Copied preset CFG main/$($_.Name)"
+        if (Test-Path -LiteralPath (Join-Path $batDir 'README_CLEAN_VISUAL_RU.txt')) {
+            Copy-Item -LiteralPath (Join-Path $batDir 'README_CLEAN_VISUAL_RU.txt') -Destination (Join-Path $dist 'README_CLEAN_VISUAL_RU.txt') -Force
         }
     }
 
-    $launcher = @'
-@echo off
-setlocal
-cd /d "%~dp0"
-echo Starting DarkWolf RTCW Final HighQuality DXR Smooth preset...
-echo Uses main\dxr_final_high_quality.cfg
-WolfSP.exe +exec dxr_final_high_quality.cfg
-'@
-    Set-Content -LiteralPath (Join-Path $dist 'RUN_DARKWOLF_DXR.bat') -Value $launcher -Encoding ASCII
+    $cfgDir = Join-Path $RepoRoot 'main'
+    foreach ($cfg in @('dxr_clean_visual_stable.cfg','dxr_clean_visual_original_risky.cfg','dxr_reset_safe.cfg')) {
+        $src = Join-Path $cfgDir $cfg
+        if (Test-Path -LiteralPath $src) {
+            Copy-Item -LiteralPath $src -Destination (Join-Path $dist 'main') -Force
+            Write-Host "Copied main/$cfg"
+        }
+    }
 
     $readme = @'
-DarkWolf RTCW Final HighQuality DXR release artifact
-===============================================
+DarkWolf RTCW DXR Clean Visual Stability runtime artifact
+=========================================================
 
-This artifact contains only runtime files produced by the GitHub Actions build.
-It does NOT contain original Return to Castle Wolfenstein game data/pk3 files.
+This artifact is intentionally based on the older Clean Release visual path.
+It does not use the later half-res / smooth / material-lite presets that changed the look.
 
-Copy these files into your existing RTCW/DarkWolf game folder:
+Main launcher:
+  RUN_CLEAN_VISUAL_RT_STABLE.bat
 
-  WolfSP.exe                 -> game root
-  main\cgamex64.dll          -> game main folder
-  main\qagamex64.dll         -> game main folder
-  main\uix64.dll             -> game main folder
-  main\dxr_final_*.cfg / main\dxr_reset_safe.cfg             -> game main folder
-  RUN_*.bat                  -> game root
+Riskier original-looking launcher:
+  RUN_CLEAN_VISUAL_RT_ORIGINAL_RISKY.bat
 
-Recommended launch:
+Reset launcher:
+  RUN_RESET_SAFE_NO_DXR.bat
 
-  1. RUN_RESET_SAFE.bat
-  2. Close the game completely.
-  3. RUN_PLAY_FINAL_HIGH_QUALITY.bat
-
-Preset notes:
-
-  RUN_PLAY_FINAL_HIGH_QUALITY.bat
-    Main recommended mode. Uses DXR mode 4 full lighting at capped 160x90,
-    frozen scene, safe sun/contact shadows, and final smooth composite.
-
-  RUN_PLAY_FINAL_STABLE.bat
-    Conservative 128x72 variant for maximum stability.
-
-  RUN_PLAY_FINAL_EXPERIMENTAL_DXR_ULTRA.bat
-    Experimental 192x108 mode with stronger lighting. Not the main launch mode.
-
-  RUN_RESET_SAFE.bat
-    Safe no-DXR reset.
-
-Patch 11 adds the final smooth composite and high-quality safe presets. It keeps
-full-resolution raster detail and uses the low-resolution DXR result as a
-soft lighting multiplier, reducing the visible pixel-square grid.
+Copy the artifact files into your DarkWolf/RTCW game folder and run the BAT files from the game root.
 '@
     Set-Content -LiteralPath (Join-Path $dist 'README_RUN_RU.txt') -Value $readme -Encoding UTF8
 
-    Write-Host 'Clean runtime package prepared in dist:'
+    Write-Host 'Clean visual runtime package prepared in dist:'
     Get-ChildItem -Path $dist -Recurse | ForEach-Object { Write-Host $_.FullName }
 }
 finally {

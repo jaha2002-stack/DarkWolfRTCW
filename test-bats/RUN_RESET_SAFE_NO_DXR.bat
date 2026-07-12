@@ -1,8 +1,5 @@
 @echo off
+setlocal
 cd /d "%~dp0"
-echo DarkWolf RTCW - Reset to safe no-DXR mode
-echo.
-echo Uses main\dxr_reset_safe.cfg
-echo.
+echo Resetting DarkWolf RTCW to safe non-DXR mode...
 WolfSP.exe +exec dxr_reset_safe.cfg
-pause
