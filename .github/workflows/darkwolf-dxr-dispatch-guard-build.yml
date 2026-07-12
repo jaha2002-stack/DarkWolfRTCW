@@ -1,0 +1,38 @@
+name: DarkWolf DXR Dispatch Guard Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Apply DXR Dispatch Guard stack
+        shell: pwsh
+        run: ./scripts/apply-dxr-dispatch-guard-full.ps1
+
+      - name: Build clean runtime release
+        shell: pwsh
+        run: ./scripts/build-windows-clean-release.ps1 -Configuration '${{ inputs.configuration }}'
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-DXR-Dispatch-Guard-${{ inputs.configuration }}
+          path: dist/**
+          if-no-files-found: error
