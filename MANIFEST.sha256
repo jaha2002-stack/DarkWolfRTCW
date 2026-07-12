@@ -1,5 +1,5 @@
 e5c5697806866ee13910a91f0ddad91f2ad63838a00fc6646df8041fbc0872e9  ./.github/workflows/darkwolf-dxr-clean-visual-performance-build.yml
-b5f31598face61fc2ed82ded80a00066806b1d78ff6a6321dbceaa24e9326743  ./README_CLEAN_VISUAL_PERFORMANCE_RU.md
+6dedb292a08d449ec20849e30c115f6b18e3e402f432ff2df599d1f963847055  ./README_CLEAN_VISUAL_PERFORMANCE_RU.md
 f0f13fdb704ef7b94f73bdf1dea766b5702aa5b84df8237813d878d1b9ccb71c  ./README_CLEAN_VISUAL_STABILITY_RU.md
 9b621ce45193948cd8b42bb4a4a9c1b3bd08736396d9e6a8922f9ff620916efd  ./main/dxr_clean_visual_balanced.cfg
 a73c6bf2419465aaf9a46634f3f30e346188c943277e907727cf334d1d7415ce  ./main/dxr_clean_visual_exact_original.cfg
@@ -14,7 +14,8 @@ e6152e9ec556756fd9aab996be264e83e7481ebe26562e6a4497466efea501cb  ./patches/00-b
 69edcf0d27cec1dc63eb4f1d86aad0ad76a2b4e43d2f82f46b56b53c3f5b6b6a  ./patches/04-dxr-visibility-debug.patch
 f9d975d293b3a8514e4dafeb55442ec1dca2bb21f689f4ff3217cdd8bb968d62  ./patches/05-dxr-clean-visual-stability-only.patch
 a0747c3c05cbd633c085ed4bed4b80600fbbd458ae71238a23f8ccee17ab19fb  ./patches/06-dxr-clean-visual-performance-pipeline.patch
-e3dde4eb8c2b3da94243eed3075dfaf58de147ac50176f30435b7250d8e820b0  ./scripts/apply-dxr-clean-visual-performance.ps1
+2822f152a4e891ba2581d3d052a9aed1689033398aa8c5101bc048fa1daaaf9a  ./patches/07-apply-script-native-exitcode-hotfix.patch
+2d70d6ef93736ec4bc7060b4715ed9ea69064ec5eda4b2d82271a57084056436  ./scripts/apply-dxr-clean-visual-performance.ps1
 728889aec0bfc7ff8351701649eb25c5da5005dd07d9807b876789b5963efa3d  ./scripts/apply-dxr-clean-visual-performance.sh
 93b59f148999b8680916dc2f48c1f3b6fcbdaad28a443d183cdd26b3cac27aa4  ./scripts/apply-dxr-clean-visual-stability.ps1
 cf0c1bae454158d7bb4ec687e474a6b09216cf425fa29456557f363643f32be1  ./scripts/apply-dxr-clean-visual-stability.sh

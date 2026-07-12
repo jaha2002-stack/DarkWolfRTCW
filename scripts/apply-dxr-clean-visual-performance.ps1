@@ -10,6 +10,14 @@ function Invoke-GitChecked {
     param([string[]]$Arguments)
     $output = & git @Arguments 2>&1
     $code = $LASTEXITCODE
+
+    # git apply --check and --reverse --check are intentionally allowed to
+    # return non-zero while the script chooses the correct patch path.
+    # Clear the native-process exit code after capturing it; otherwise pwsh
+    # can finish the GitHub Actions step with exit code 1 even after every
+    # validated fallback edit succeeded.
+    $global:LASTEXITCODE = 0
+
     [pscustomobject]@{ Code = $code; Output = ($output -join [Environment]::NewLine) }
 }
 
@@ -244,3 +252,7 @@ try {
 finally {
     Pop-Location
 }
+
+Write-Host 'DXR Clean Visual Performance patch stack applied successfully.'
+$global:LASTEXITCODE = 0
+exit 0

@@ -37,3 +37,9 @@ Artifact:
 ## Важно
 
 Этот patch не обещает одинаковый прирост на всех GPU. Он убирает подтверждённые полные синхронизации и повторную работу, не заменяя визуальный path. Если `BALANCED` уже даёт хороший FPS, используйте его: там DispatchRays остаётся каждый кадр.
+
+## v2: Apply-step exit code fix
+
+Исправлен ложный `Process completed with exit code 1` после успешного применения
+validated source transformations. Скрипт теперь очищает ожидаемый ненулевой
+код от `git apply --check` и явно завершает успешный apply-step кодом 0.
