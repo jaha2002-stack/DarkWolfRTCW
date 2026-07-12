@@ -124,6 +124,19 @@ try {
         }
     }
 
+
+    # Copy DXR Dispatch Guard test BAT files into the artifact root.
+    $testBatDir = Join-Path $RepoRoot 'test-bats'
+    if (Test-Path -LiteralPath $testBatDir) {
+        Get-ChildItem -Path $testBatDir -Filter '*.bat' -File | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $dist -Force
+            Write-Host "Copied test BAT $($_.Name)"
+        }
+        if (Test-Path -LiteralPath (Join-Path $testBatDir 'README_TESTS_RU.txt')) {
+            Copy-Item -LiteralPath (Join-Path $testBatDir 'README_TESTS_RU.txt') -Destination (Join-Path $dist 'README_DXR_DISPATCH_TESTS_RU.txt') -Force
+        }
+    }
+
     $launcher = @'
 @echo off
 setlocal
@@ -134,7 +147,7 @@ WolfSP.exe +set r_dxr 1 +set r_dxrFallbackLight 1 +set r_dxrAmbientIntensity 1.3
     Set-Content -LiteralPath (Join-Path $dist 'RUN_DARKWOLF_DXR.bat') -Value $launcher -Encoding ASCII
 
     $readme = @'
-DarkWolf RTCW DXR clean release artifact
+DarkWolf RTCW DXR Dispatch Guard release artifact
 ========================================
 
 This artifact contains only runtime files produced by the GitHub Actions build.
