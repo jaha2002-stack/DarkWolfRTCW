@@ -1,0 +1,1041 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 98eebba..833fe5e 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -27,6 +27,10 @@ extern void __cdecl Com_Printf(const char* fmt, ...);
+ 
+ using Microsoft::WRL::ComPtr;
+ 
++// ============================================================
++// DXR TrueRT M2/M3 Visual Restore + Material/Temporal pipeline
++// ============================================================
++
+ // ============================================================
+ // Logging / checks
+ // ============================================================
+@@ -931,7 +935,8 @@ static inline void glRaytracingBuildInstanceDesc(
+ 	D3D12_GPU_VIRTUAL_ADDRESS blasGpuVA)
+ {
+ 	memcpy(outDesc->Transform, inst.descCpu.transform, sizeof(float) * 12);
+-	outDesc->InstanceID = inst.descCpu.instanceID;
++	const glRaytracingMeshRecord_t* mesh = glRaytracingFindMeshConst(inst.descCpu.meshHandle);
++	outDesc->InstanceID = mesh ? (UINT)glRaytracingClamp<uint32_t>(mesh->handle, 0u, GL_RAYTRACING_MAX_MATERIALS - 1u) : inst.descCpu.instanceID;
+ 	outDesc->InstanceMask = (UINT8)(inst.descCpu.mask ? inst.descCpu.mask : 0xFF);
+ 	outDesc->InstanceContributionToHitGroupIndex = 0;
+ 	outDesc->Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+@@ -1860,14 +1865,44 @@ struct glRaytracingLightingConstants_t
+ 	uint32_t dispatchWidth;
+ 	uint32_t dispatchHeight;
+ 	uint32_t compositeBlocks;
++
++	float rtStrength;
++	float specularStrength;
++	float reflectionStrength;
++	float shadowStrength;
++
++	float denoiseStrength;
++	float temporalStrength;
++	float giStrength;
++	uint32_t materialCount;
++
++	uint32_t historyValid;
++	uint32_t materialMode;
++	uint32_t m2m3Pad0;
++	uint32_t m2m3Pad1;
+ };
+ 
++struct glRaytracingMaterial_t
++{
++	float albedo[4];       // rgb + alpha
++	float material[4];     // roughness, metallic, specular, emissive
++};
++
++static const uint32_t GL_RAYTRACING_MAX_MATERIALS = 8192;
++
+ struct glRaytracingLightingState_t
+ {
+ 	std::vector<glRaytracingLight_t> cpuLights;
+ 	std::vector<glRaytracingLight_t> uploadLights;
+ 	glRaytracingLightingConstants_t constants;
+ 	uint32_t syncAfterDispatch;
++	uint32_t historyWidth;
++	uint32_t historyHeight;
++	DXGI_FORMAT historyFormat;
++
++	ComPtr<ID3D12Resource> historyTexture;
++	D3D12_RESOURCE_STATES historyState;
++	glRaytracingBuffer_t materialBuffer;
+ 
+ 	ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+ 	UINT descriptorStride;
+@@ -1903,8 +1938,22 @@ struct glRaytracingLightingState_t
+ 		constants.sunColor[0] = 1.0f;
+ 		constants.sunColor[1] = 0.92f;
+ 		constants.sunColor[2] = 0.80f;
++		constants.rtStrength = 1.25f;
++		constants.specularStrength = 1.85f;
++		constants.reflectionStrength = 1.20f;
++		constants.shadowStrength = 1.15f;
++		constants.denoiseStrength = 0.65f;
++		constants.temporalStrength = 0.55f;
++		constants.giStrength = 0.85f;
++		constants.materialCount = 1u;
++		constants.historyValid = 0u;
++		constants.materialMode = 1u;
+ 		descriptorStride = 0;
+ 		syncAfterDispatch = 0;
++		historyWidth = 0;
++		historyHeight = 0;
++		historyFormat = DXGI_FORMAT_UNKNOWN;
++		historyState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+ 		initialized = false;
+ 	}
+ };
+@@ -1939,6 +1988,14 @@ struct ShadowPayload
+     uint hit;
+ };
+ 
++struct RadiancePayload
++{
++    uint hit;
++    uint materialId;
++    float hitT;
++    float3 color;
++};
++
+ cbuffer LightingCB : register(b0)
+ {
+     float4x4 gInvViewProj;
+@@ -1971,6 +2028,27 @@ cbuffer LightingCB : register(b0)
+     uint     gDispatchWidth;
+     uint     gDispatchHeight;
+     uint     gCompositeBlocks;
++
++    float    gRTStrength;
++    float    gSpecularStrength;
++    float    gReflectionStrength;
++    float    gShadowStrength;
++
++    float    gDenoiseStrength;
++    float    gTemporalStrength;
++    float    gGIStrength;
++    uint     gMaterialCount;
++
++    uint     gHistoryValid;
++    uint     gMaterialMode;
++    uint     gM2M3Pad0;
++    uint     gM2M3Pad1;
++};
++
++struct RTMaterial
++{
++    float4 albedo;
++    float4 material; // roughness, metallic, specular, emissive
+ };
+ 
+ StructuredBuffer<Light> gLights : register(t0);
+@@ -1979,6 +2057,8 @@ Texture2D<float>        gDepthTex    : register(t2);
+ Texture2D<float4>       gNormalTex   : register(t3);
+ Texture2D<float4>       gPositionTex : register(t4);
+ RaytracingAccelerationStructure gSceneBVH : register(t5);
++StructuredBuffer<RTMaterial> gMaterials : register(t6);
++Texture2D<float4>       gHistoryTex  : register(t7);
+ RWTexture2D<float4>     gOutputTex   : register(u0);
+ 
+ static const uint GL_RAYTRACING_LIGHT_TYPE_POINT = 0;
+@@ -2005,12 +2085,53 @@ void ShadowMiss(inout ShadowPayload payload)
+     payload.hit = 0;
+ }
+ 
++[shader("miss")]
++void RadianceMiss(inout RadiancePayload payload)
++{
++    payload.hit = 0u;
++    payload.materialId = 0u;
++}
++
+ [shader("closesthit")]
+ void ShadowClosestHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+ {
+     payload.hit = 1;
+ }
+ 
++RTMaterial LoadMaterial(uint materialId)
++{
++    RTMaterial m;
++    m.albedo = float4(0.78, 0.74, 0.66, 1.0);
++    m.material = float4(0.32, 0.0, 0.75, 0.0);
++
++    if (gMaterialCount > 0u)
++    {
++        uint idx = min(materialId, gMaterialCount - 1u);
++        m = gMaterials[idx];
++    }
++
++    m.albedo.rgb = max(m.albedo.rgb, float3(0.02, 0.02, 0.02));
++    m.material.x = saturate(m.material.x);
++    m.material.y = saturate(m.material.y);
++    m.material.z = saturate(m.material.z);
++    m.material.w = max(m.material.w, 0.0);
++    return m;
++}
++
++[shader("closesthit")]
++void RadianceClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAttributes attr)
++{
++    uint id = InstanceID();
++    RTMaterial m = LoadMaterial(id);
++    payload.hit = 1u;
++    payload.materialId = id;
++    payload.hitT = RayTCurrent();
++
++    float facing = saturate(abs(dot(WorldRayDirection(), -WorldRayDirection())));
++    float specHint = lerp(0.35, 1.0, m.material.z);
++    payload.color = m.albedo.rgb * (0.32 + 0.30 * specHint + 0.10 * facing) + m.material.w;
++}
++
+ float TraceShadow(float3 origin, float3 dir, float maxT)
+ {
+     RayDesc ray;
+@@ -2035,6 +2156,34 @@ float TraceShadow(float3 origin, float3 dir, float maxT)
+     return (payload.hit != 0) ? 0.0 : 1.0;
+ }
+ 
++float3 TraceRadianceMaterial(float3 origin, float3 dir, float maxT, float3 missColor, out float hitMask)
++{
++    RayDesc ray;
++    ray.Origin = origin;
++    ray.Direction = dir;
++    ray.TMin = 0.001;
++    ray.TMax = maxT;
++
++    RadiancePayload payload;
++    payload.hit = 0u;
++    payload.materialId = 0u;
++    payload.hitT = maxT;
++    payload.color = missColor;
++
++    TraceRay(
++        gSceneBVH,
++        RAY_FLAG_CULL_FRONT_FACING_TRIANGLES,
++        0xFF,
++        1,
++        2,
++        1,
++        ray,
++        payload);
++
++    hitMask = (payload.hit != 0u) ? 1.0 : 0.0;
++    return (payload.hit != 0u) ? payload.color : missColor;
++}
++
+ float Hash12(float2 p)
+ {
+     float3 p3 = frac(float3(p.xyx) * 0.1031);
+@@ -2358,36 +2507,87 @@ float3 ComputeSpecular(float3 N, float3 V, float3 L, float3 lightColor, float li
+ 
+ float3 ComputeTrueRTReflectionGI(float3 worldPos, float3 N, float3 V, float3 baseAlbedo, uint2 pixel, float skyVis)
+ {
+-    // DXR TRUE RT M1:
+-    // This is the first real ray-traced reflection/GI step.  It still uses the
+-    // existing shadow hit group for stability, but it traces a real reflection
+-    // ray through the TLAS and converts the result into a conservative glossy
+-    // indirect/specular contribution.  Later milestones can replace this with
+-    // a full material closest-hit shader and texture table.
+     float NdotV = saturate(dot(N, V));
+     float3 R = normalize(reflect(-V, N));
+ 
+-    float roughMetalHint = saturate((max(max(baseAlbedo.r, baseAlbedo.g), baseAlbedo.b) - 0.70) * 1.65);
++    float luma = dot(baseAlbedo, float3(0.299, 0.587, 0.114));
++    float brightMetalHint = saturate((max(max(baseAlbedo.r, baseAlbedo.g), baseAlbedo.b) - 0.55) * 1.85);
++    float darkGlossHint = saturate((0.42 - luma) * 1.4);
+     float fresnel = pow(1.0 - NdotV, 5.0);
+-    float reflectStrength = saturate(0.035 + fresnel * 0.45 + roughMetalHint * 0.16);
+ 
+-    float3 rayOrigin = worldPos + N * (gShadowBias * 2.5) + R * (gShadowBias * 2.0);
+-    float missVisibility = TraceShadow(rayOrigin, R, 8192.0);
++    float roughness = saturate(0.38 - brightMetalHint * 0.22 + darkGlossHint * 0.12);
++    float specHint = saturate(0.35 + brightMetalHint * 0.65 + fresnel * 0.85);
++
++    float3 rayOrigin = worldPos + N * (gShadowBias * 2.8) + R * (gShadowBias * 2.0);
+ 
+     float upness = saturate(R.z * 0.5 + 0.5);
+-    float3 skyCol = lerp(float3(0.18, 0.20, 0.24), float3(0.58, 0.62, 0.70), upness);
+-    float3 hitCol = baseAlbedo * 0.18;
+-    float3 reflCol = lerp(hitCol, skyCol * max(skyVis, 0.35), missVisibility);
++    float3 skyCol = lerp(float3(0.12, 0.14, 0.18), float3(0.70, 0.76, 0.88), upness) * max(skyVis, 0.28);
++
++    float hitMask = 0.0;
++    float3 matCol = TraceRadianceMaterial(rayOrigin, R, 16384.0, skyCol, hitMask);
++
++    // Secondary GI bounce: a cosine-ish tilted ray gives visible corner fill / darkening
++    // without full path tracing recursion.
++    float3 tangent, bitangent;
++    BuildOrthonormalBasis(N, tangent, bitangent);
++    float rand = Hash12((float2)pixel + worldPos.xy * 0.031 + worldPos.zz * 0.017);
++    float3 h = CosineSampleHemisphere(float2(rand, frac(rand * 7.17)));
++    float3 giDir = normalize(tangent * h.x + bitangent * h.y + N * h.z);
++    float giHit = 0.0;
++    float3 giCol = TraceRadianceMaterial(worldPos + N * (gShadowBias * 2.0), giDir, 4096.0, skyCol * 0.55, giHit);
+ 
+-    // Tiny blue-noise-like dither hides low-res RT cell boundaries without
+-    // changing the underlying full-resolution raster texture detail.
++    float reflectionPower = (0.08 + fresnel * 0.70 + specHint * 0.28) * max(gReflectionStrength, 0.0);
++    reflectionPower *= lerp(1.0, 0.55, roughness);
++
++    float3 reflectionCol = lerp(skyCol, matCol, hitMask);
++    float3 giContribution = giCol * (0.10 + 0.20 * (1.0 - giHit)) * max(gGIStrength, 0.0);
++
++    // Add a small deterministic shimmer, not random temporal noise, so specular
++    // highlights are visible but stable.
+     float d = Hash12((float2)pixel + worldPos.xy * 0.017 + worldPos.zz * 0.031) - 0.5;
+-    reflectStrength *= 1.0 + d * 0.12;
++    reflectionPower *= 1.0 + d * 0.08;
+ 
+-    return reflCol * reflectStrength;
++    return reflectionCol * reflectionPower + giContribution;
+ }
++
+ )"
+ R"(
++float3 DXR_Denoise3x3(uint2 pixel, float3 current, uint screenW, uint screenH)
++{
++    float3 acc = current * 4.0;
++    float w = 4.0;
++    [unroll]
++    for (int oy = -1; oy <= 1; ++oy)
++    {
++        [unroll]
++        for (int ox = -1; ox <= 1; ++ox)
++        {
++            if (ox == 0 && oy == 0) continue;
++            int2 p = int2(pixel) + int2(ox, oy);
++            p.x = clamp(p.x, 0, (int)screenW - 1);
++            p.y = clamp(p.y, 0, (int)screenH - 1);
++            float3 n = gAlbedoTex.Load(int3(p, 0)).rgb;
++            float lumDelta = abs(dot(n - current, float3(0.299, 0.587, 0.114)));
++            float nw = saturate(1.0 - lumDelta * 3.5);
++            acc += n * nw;
++            w += nw;
++        }
++    }
++    return acc / max(w, 1e-3);
++}
++
++float3 DXR_ApplyTemporal(uint2 pixel, float3 current)
++{
++    if (gHistoryValid == 0u || gTemporalStrength <= 0.001)
++        return current;
++
++    float3 h = gHistoryTex.Load(int3(pixel, 0)).rgb;
++    float3 lo = min(current, h) - 0.18;
++    float3 hi = max(current, h) + 0.18;
++    h = clamp(h, lo, hi);
++    return lerp(current, h, saturate(gTemporalStrength));
++}
++
+ void StoreRaytracedOutput(uint2 dispatchPixel, float4 color)
+ {
+     uint screenW = max((uint)gScreenSize.x, 1u);
+@@ -2398,7 +2598,16 @@ void StoreRaytracedOutput(uint2 dispatchPixel, float4 color)
+     if (gCompositeBlocks == 0u || (dispatchW >= screenW && dispatchH >= screenH))
+     {
+         if (dispatchPixel.x < screenW && dispatchPixel.y < screenH)
+-            gOutputTex[dispatchPixel] = color;
++        {
++            float4 base = gAlbedoTex.Load(int3(dispatchPixel, 0));
++            float3 outColor = color.rgb;
++            if (gRaygenMode == 4u)
++            {
++                outColor = lerp(base.rgb, color.rgb, saturate(gRTStrength));
++                outColor = DXR_ApplyTemporal(dispatchPixel, outColor);
++            }
++            gOutputTex[dispatchPixel] = float4(outColor, color.a);
++        }
+         return;
+     }
+ 
+@@ -2412,13 +2621,10 @@ void StoreRaytracedOutput(uint2 dispatchPixel, float4 color)
+     x1 = min(max(x1, x0 + 1u), screenW);
+     y1 = min(max(y1, y0 + 1u), screenH);
+ 
+-    // DXR TRUE RT M1 smooth composite:
+-    // Keep the stable low-resolution full-lighting pass, but do not write its
+-    // shaded color as a hard rectangular block.  Treat the RT result as a
+-    // controlled lighting multiplier for the full-resolution raster image, fade
+-    // it toward the original image at block borders, and use mostly luminance
+-    // instead of raw low-res chroma. This keeps contact shadows / RT lighting
+-    // visible while hiding the large pixel-square grid.
++    // M2/M3 visual restore composite: use low-res rays as a high-contrast
++    // lighting/specular/shadow signal over full-res raster texture. Unlike the
++    // older block copy, the RT ratio is denoised, edge-faded, temporally blended,
++    // and applied to every full-res pixel so texture detail stays sharp.
+     if (gRaygenMode == 4u)
+     {
+         uint sx = ((dispatchPixel.x * 2u + 1u) * screenW) / (dispatchW * 2u);
+@@ -2426,14 +2632,14 @@ void StoreRaytracedOutput(uint2 dispatchPixel, float4 color)
+         uint2 samplePixel = uint2(min(sx, screenW - 1u), min(sy, screenH - 1u));
+ 
+         const float3 luma = float3(0.299, 0.587, 0.114);
+-        float3 sampleBase = max(gAlbedoTex.Load(int3(samplePixel, 0)).rgb, float3(0.08, 0.08, 0.08));
++        float3 sampleBase = max(gAlbedoTex.Load(int3(samplePixel, 0)).rgb, float3(0.06, 0.06, 0.06));
+         float3 rawRatio = color.rgb / sampleBase;
+ 
+-        float baseLum = max(dot(sampleBase, luma), 0.08);
++        float baseLum = max(dot(sampleBase, luma), 0.06);
+         float rtLum = max(dot(color.rgb, luma), 0.02);
+-        float lumRatio = clamp(rtLum / baseLum, 0.50, 1.70);
+-        float3 chromaRatio = clamp(rawRatio, float3(0.55, 0.55, 0.55), float3(1.75, 1.75, 1.75));
+-        float3 smoothRatio = lerp(float3(lumRatio, lumRatio, lumRatio), chromaRatio, 0.35);
++        float lumRatio = clamp(rtLum / baseLum, 0.32, 2.45);
++        float3 chromaRatio = clamp(rawRatio, float3(0.28, 0.28, 0.28), float3(2.75, 2.75, 2.75));
++        float3 smoothRatio = lerp(float3(lumRatio, lumRatio, lumRatio), chromaRatio, 0.62);
+ 
+         float invBlockW = 1.0 / max((float)(x1 - x0), 1.0);
+         float invBlockH = 1.0 / max((float)(y1 - y0), 1.0);
+@@ -2444,24 +2650,27 @@ void StoreRaytracedOutput(uint2 dispatchPixel, float4 color)
+             [loop]
+             for (uint x = x0; x < x1; ++x)
+             {
+-                float4 pxBase = gAlbedoTex.Load(int3(uint2(x, y), 0));
++                uint2 p = uint2(x, y);
++                float4 pxBase = gAlbedoTex.Load(int3(p, 0));
++                float3 baseDenoised = lerp(pxBase.rgb, DXR_Denoise3x3(p, pxBase.rgb, screenW, screenH), saturate(gDenoiseStrength) * 0.25);
+ 
+                 float2 blockUv = (float2((float)(x - x0), (float)(y - y0)) + 0.5) * float2(invBlockW, invBlockH);
+                 float edgeX = min(blockUv.x, 1.0 - blockUv.x);
+                 float edgeY = min(blockUv.y, 1.0 - blockUv.y);
+-                float edgeFade = saturate(min(edgeX, edgeY) * 3.5);
++                float edgeFade = saturate(min(edgeX, edgeY) * 4.0);
+                 edgeFade = edgeFade * edgeFade * (3.0 - 2.0 * edgeFade);
+ 
+-                // Strongest RT contribution near the center of each low-res cell,
+-                // softer at borders so adjacent cells do not form visible squares.
+-                float rtStrength = lerp(0.45, 0.90, edgeFade);
++                float rtStrength = saturate(gRTStrength) * lerp(0.78, 1.0, edgeFade);
+                 float3 finalRatio = lerp(float3(1.0, 1.0, 1.0), smoothRatio, rtStrength);
+-                float3 outColor = pxBase.rgb * finalRatio;
++                float3 outColor = baseDenoised * finalRatio;
+ 
+-                // Avoid crushed black blocks in dark areas, but still allow contact
+-                // shadows to slightly darken corners and occluded surfaces.
+-                outColor = max(outColor, pxBase.rgb * 0.35);
+-                gOutputTex[uint2(x, y)] = float4(outColor, pxBase.a);
++                // Do not wash out the old visible RT look: keep deep contact
++                // shadows and bright specular highlights, but bound extremes to
++                // avoid TDR-causing fireflies/noise.
++                outColor = clamp(outColor, pxBase.rgb * 0.20, max(pxBase.rgb * 2.55, float3(0.15, 0.15, 0.15)));
++                outColor = DXR_ApplyTemporal(p, outColor);
++
++                gOutputTex[p] = float4(outColor, pxBase.a);
+             }
+         }
+         return;
+@@ -2580,8 +2789,8 @@ void RayGen()
+             float3 sunOrigin = worldPos + N * (gShadowBias * 3.0) + sunL * (gShadowBias * 2.0);
+             float sunVis = TraceShadow(sunOrigin, sunL, 1000000.0);
+             float sunShadow = lerp(1.0, sunVis, saturate(gSunShadowStrength));
+-            lightingAccum += gSunColor.rgb * (gSunIntensity * sunNoL * sunShadow);
+-            specularAccum += ComputeSpecular(N, V, sunL, gSunColor.rgb, gSunIntensity, 1.0, sunShadow, baseAlbedo);
++            lightingAccum += gSunColor.rgb * (gSunIntensity * sunNoL * lerp(1.0, sunShadow, saturate(gShadowStrength)));
++            specularAccum += ComputeSpecular(N, V, sunL, gSunColor.rgb, gSunIntensity, 1.0, sunShadow, baseAlbedo) * max(gSpecularStrength, 0.0);
+         }
+     }
+ 
+@@ -2611,10 +2820,10 @@ void RayGen()
+                 shadow = TraceSoftShadow(worldPos, N, Lgt, toLight, dist);
+             }
+ 
+-            float3 diffuse = Lgt.color * (Lgt.intensity * atten * NdotLWrap * shadow);
++            float3 diffuse = Lgt.color * (Lgt.intensity * atten * NdotLWrap * lerp(1.0, shadow, saturate(gShadowStrength)));
+             lightingAccum += diffuse;
+ 
+-            specularAccum += ComputeSpecular(N, V, L, Lgt.color, Lgt.intensity, atten, shadow, baseAlbedo);
++            specularAccum += ComputeSpecular(N, V, L, Lgt.color, Lgt.intensity, atten, shadow, baseAlbedo) * max(gSpecularStrength, 0.0);
+         }
+         else if (Lgt.type == GL_RAYTRACING_LIGHT_TYPE_RECT)
+         {
+@@ -2680,8 +2889,8 @@ void RayGen()
+             rectDiffuseAccum /= (float)sampleCount;
+             rectSpecAccum    /= (float)sampleCount;
+ 
+-            lightingAccum += clamp(rectDiffuseAccum * atten * shadow, 0.0, 4.0);
+-            specularAccum += rectSpecAccum * atten * shadow;
++            lightingAccum += clamp(rectDiffuseAccum * atten * lerp(1.0, shadow, saturate(gShadowStrength)), 0.0, 4.0);
++            specularAccum += rectSpecAccum * atten * shadow * max(gSpecularStrength, 0.0);
+         }
+     }
+ 
+@@ -2689,7 +2898,7 @@ void RayGen()
+     // visible without enabling the old unsafe full-resolution path.
+     specularAccum += ComputeTrueRTReflectionGI(worldPos, N, V, baseAlbedo, pixel, skyVis);
+ 
+-    lightingAccum *= ao;
++    lightingAccum *= lerp(1.0, ao, saturate(gShadowStrength));
+     specularAccum *= lerp(1.0, ao, 0.5);
+ 
+     if (geoFlag == GEOMETRY_FLAG_SKELETAL)
+@@ -2708,7 +2917,7 @@ void RayGen()
+         rtLitColor = max(rtLitColor, baseAlbedo * 0.15);
+ 
+         float legacyKeep = saturate(gLegacyBlend);
+-        float3 finalColor = lerp(rtLitColor, baseAlbedo, legacyKeep);
++        float3 finalColor = lerp(baseAlbedo, rtLitColor, saturate((1.0 - legacyKeep) * max(gRTStrength, 0.0)));
+         finalColor *= max(gExposure, 0.001);
+ 
+         if (gDebugMode == 1)
+@@ -2807,7 +3016,7 @@ static ComPtr<IDxcBlob> glRaytracingLightingCompileLibrary(const char* src)
+ static int glRaytracingLightingCreateDescriptorHeap(void)
+ {
+ 	D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+-	hd.NumDescriptors = 7;
++	hd.NumDescriptors = 9;
+ 	hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+ 	hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+ 
+@@ -2824,7 +3033,7 @@ static int glRaytracingLightingCreateRootSignatures(void)
+ 		D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+ 
+ 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+-		ranges[0].NumDescriptors = 6;
++		ranges[0].NumDescriptors = 8;
+ 		ranges[0].BaseShaderRegister = 0;
+ 		ranges[0].RegisterSpace = 0;
+ 		ranges[0].OffsetInDescriptorsFromTableStart = 0;
+@@ -2880,6 +3089,121 @@ static int glRaytracingLightingCreateRootSignatures(void)
+ 	return 1;
+ }
+ 
++
++static void glRaytracingLightingBuildMaterialTable(std::vector<glRaytracingMaterial_t>& outMaterials)
++{
++	outMaterials.clear();
++	outMaterials.resize(1);
++	outMaterials[0].albedo[0] = 0.78f;
++	outMaterials[0].albedo[1] = 0.74f;
++	outMaterials[0].albedo[2] = 0.66f;
++	outMaterials[0].albedo[3] = 1.0f;
++	outMaterials[0].material[0] = 0.32f;
++	outMaterials[0].material[1] = 0.0f;
++	outMaterials[0].material[2] = 0.75f;
++	outMaterials[0].material[3] = 0.0f;
++
++	for (size_t i = 0; i < g_glRaytracingScene.meshes.size(); ++i)
++	{
++		const glRaytracingMeshRecord_t& mesh = g_glRaytracingScene.meshes[i];
++		if (!mesh.alive || mesh.handle >= GL_RAYTRACING_MAX_MATERIALS)
++			continue;
++
++		if (outMaterials.size() <= mesh.handle)
++			outMaterials.resize((size_t)mesh.handle + 1, outMaterials[0]);
++
++		glRaytracingMaterial_t m = {};
++		const float dynamicHint = mesh.descCpu.allowUpdate ? 1.0f : 0.0f;
++		const float triCount = (float)(mesh.indicesCpu.size() / 3);
++		const float detailHint = glRaytracingClamp<float>(triCount / 256.0f, 0.0f, 1.0f);
++
++		m.albedo[0] = 0.62f + 0.18f * detailHint;
++		m.albedo[1] = 0.58f + 0.14f * detailHint;
++		m.albedo[2] = 0.50f + 0.10f * detailHint;
++		m.albedo[3] = 1.0f;
++
++		// Material-lite table. RTCW/DarkWolf does not expose the original shader
++		// texture descriptors to this DXR module yet, so M2 uses stable per-mesh
++		// material IDs plus G-buffer albedo on primary pixels. Reflection rays now
++		// hit real TLAS geometry and return material response instead of miss-only sky.
++		m.material[0] = 0.28f + 0.16f * dynamicHint;          // roughness
++		m.material[1] = 0.00f;                                // metallic
++		m.material[2] = 0.85f - 0.20f * dynamicHint;          // specular
++		m.material[3] = 0.00f;                                // emissive
++
++		outMaterials[mesh.handle] = m;
++	}
++
++	if (outMaterials.size() > GL_RAYTRACING_MAX_MATERIALS)
++		outMaterials.resize(GL_RAYTRACING_MAX_MATERIALS);
++}
++
++static void glRaytracingLightingUpdateMaterialBuffer(void)
++{
++	if (!g_glRaytracingLighting.materialBuffer.resource)
++		return;
++
++	std::vector<glRaytracingMaterial_t> materials;
++	glRaytracingLightingBuildMaterialTable(materials);
++	const size_t count = glRaytracingClamp<size_t>(materials.size(), 1, GL_RAYTRACING_MAX_MATERIALS);
++	g_glRaytracingLighting.constants.materialCount = (uint32_t)count;
++	glRaytracingMapCopy(
++		g_glRaytracingLighting.materialBuffer.resource.Get(),
++		materials.data(),
++		count * sizeof(glRaytracingMaterial_t));
++}
++
++static int glRaytracingLightingEnsureHistoryTexture(const glRaytracingLightingPassDesc_t* pass)
++{
++	if (!pass || !pass->outputTexture || pass->width == 0 || pass->height == 0)
++		return 0;
++
++	if (g_glRaytracingLighting.historyTexture &&
++		g_glRaytracingLighting.historyWidth == pass->width &&
++		g_glRaytracingLighting.historyHeight == pass->height &&
++		g_glRaytracingLighting.historyFormat == pass->outputFormat)
++	{
++		return 1;
++	}
++
++	D3D12_HEAP_PROPERTIES hp = {};
++	hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++
++	D3D12_RESOURCE_DESC rd = {};
++	rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++	rd.Alignment = 0;
++	rd.Width = pass->width;
++	rd.Height = pass->height;
++	rd.DepthOrArraySize = 1;
++	rd.MipLevels = 1;
++	rd.Format = pass->outputFormat;
++	rd.SampleDesc.Count = 1;
++	rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++	rd.Flags = D3D12_RESOURCE_FLAG_NONE;
++
++	g_glRaytracingLighting.historyTexture.Reset();
++	HRESULT hr = g_glRaytracingCmd.device->CreateCommittedResource(
++		&hp,
++		D3D12_HEAP_FLAG_NONE,
++		&rd,
++		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
++		nullptr,
++		IID_PPV_ARGS(&g_glRaytracingLighting.historyTexture));
++
++	if (FAILED(hr))
++	{
++		glRaytracingHandleFailure(hr, "CreateCommittedResource historyTexture", __FILE__, __LINE__);
++		return 0;
++	}
++
++	g_glRaytracingLighting.historyWidth = pass->width;
++	g_glRaytracingLighting.historyHeight = pass->height;
++	g_glRaytracingLighting.historyFormat = pass->outputFormat;
++	g_glRaytracingLighting.historyState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++	g_glRaytracingLighting.constants.historyValid = 0u;
++	return 1;
++}
++
+ static int glRaytracingLightingCreateBuffers(void)
+ {
+ 	g_glRaytracingLighting.constantBuffer = glRaytracingCreateBuffer(
+@@ -2896,7 +3220,16 @@ static int glRaytracingLightingCreateBuffers(void)
+ 		D3D12_RESOURCE_STATE_GENERIC_READ,
+ 		D3D12_RESOURCE_FLAG_NONE);
+ 
+-	return g_glRaytracingLighting.constantBuffer.resource && g_glRaytracingLighting.lightBuffer.resource;
++	g_glRaytracingLighting.materialBuffer = glRaytracingCreateBuffer(
++		g_glRaytracingCmd.device.Get(),
++		sizeof(glRaytracingMaterial_t) * GL_RAYTRACING_MAX_MATERIALS,
++		D3D12_HEAP_TYPE_UPLOAD,
++		D3D12_RESOURCE_STATE_GENERIC_READ,
++		D3D12_RESOURCE_FLAG_NONE);
++
++	return g_glRaytracingLighting.constantBuffer.resource &&
++		g_glRaytracingLighting.lightBuffer.resource &&
++		g_glRaytracingLighting.materialBuffer.resource;
+ }
+ 
+ static void glRaytracingLightingUpdateConstants(void)
+@@ -2976,16 +3309,36 @@ static void glRaytracingLightingCreatePersistentLightSRV(void)
+ 		glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 0));
+ }
+ 
++static void glRaytracingLightingCreatePersistentMaterialSRV(void)
++{
++	D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
++	srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++	srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++	srv.Format = DXGI_FORMAT_UNKNOWN;
++	srv.Buffer.FirstElement = 0;
++	srv.Buffer.NumElements = GL_RAYTRACING_MAX_MATERIALS;
++	srv.Buffer.StructureByteStride = sizeof(glRaytracingMaterial_t);
++	srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
++
++	D3D12_CPU_DESCRIPTOR_HANDLE base = g_glRaytracingLighting.descriptorHeap->GetCPUDescriptorHandleForHeapStart();
++	g_glRaytracingCmd.device->CreateShaderResourceView(
++		g_glRaytracingLighting.materialBuffer.resource.Get(),
++		&srv,
++		glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 6));
++}
++
+ static int glRaytracingLightingCreateStateObject(void)
+ {
+ 	ComPtr<IDxcBlob> dxil = glRaytracingLightingCompileLibrary(g_glRaytracingLightingHlsl);
+ 	if (!dxil)
+ 		return 0;
+ 
+-	D3D12_EXPORT_DESC exports[3] = {};
++	D3D12_EXPORT_DESC exports[5] = {};
+ 	exports[0].Name = L"RayGen";
+ 	exports[1].Name = L"ShadowMiss";
+-	exports[2].Name = L"ShadowClosestHit";
++	exports[2].Name = L"RadianceMiss";
++	exports[3].Name = L"ShadowClosestHit";
++	exports[4].Name = L"RadianceClosestHit";
+ 
+ 	D3D12_DXIL_LIBRARY_DESC libDesc = {};
+ 	D3D12_SHADER_BYTECODE libBytecode = {};
+@@ -2995,13 +3348,16 @@ static int glRaytracingLightingCreateStateObject(void)
+ 	libDesc.NumExports = _countof(exports);
+ 	libDesc.pExports = exports;
+ 
+-	D3D12_HIT_GROUP_DESC hitGroup = {};
+-	hitGroup.HitGroupExport = L"ShadowHitGroup";
+-	hitGroup.ClosestHitShaderImport = L"ShadowClosestHit";
+-	hitGroup.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
++	D3D12_HIT_GROUP_DESC hitGroups[2] = {};
++	hitGroups[0].HitGroupExport = L"ShadowHitGroup";
++	hitGroups[0].ClosestHitShaderImport = L"ShadowClosestHit";
++	hitGroups[0].Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
++	hitGroups[1].HitGroupExport = L"RadianceHitGroup";
++	hitGroups[1].ClosestHitShaderImport = L"RadianceClosestHit";
++	hitGroups[1].Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+ 
+ 	D3D12_RAYTRACING_SHADER_CONFIG shaderConfig = {};
+-	shaderConfig.MaxPayloadSizeInBytes = sizeof(uint32_t);
++	shaderConfig.MaxPayloadSizeInBytes = 32;
+ 	shaderConfig.MaxAttributeSizeInBytes = 8;
+ 
+ 	D3D12_GLOBAL_ROOT_SIGNATURE globalRS = {};
+@@ -3010,7 +3366,7 @@ static int glRaytracingLightingCreateStateObject(void)
+ 	D3D12_LOCAL_ROOT_SIGNATURE localRS = {};
+ 	localRS.pLocalRootSignature = g_glRaytracingLighting.localRootSig.Get();
+ 
+-	D3D12_STATE_SUBOBJECT subobjects[8] = {};
++	D3D12_STATE_SUBOBJECT subobjects[9] = {};
+ 	UINT sub = 0;
+ 
+ 	subobjects[sub].Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+@@ -3018,7 +3374,11 @@ static int glRaytracingLightingCreateStateObject(void)
+ 	++sub;
+ 
+ 	subobjects[sub].Type = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
+-	subobjects[sub].pDesc = &hitGroup;
++	subobjects[sub].pDesc = &hitGroups[0];
++	++sub;
++
++	subobjects[sub].Type = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
++	subobjects[sub].pDesc = &hitGroups[1];
+ 	++sub;
+ 
+ 	subobjects[sub].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
+@@ -3033,9 +3393,9 @@ static int glRaytracingLightingCreateStateObject(void)
+ 	subobjects[sub].pDesc = &localRS;
+ 	++sub;
+ 
+-	LPCWSTR localExports[] = { L"RayGen", L"ShadowMiss", L"ShadowHitGroup" };
++	LPCWSTR localExports[] = { L"RayGen", L"ShadowMiss", L"RadianceMiss", L"ShadowHitGroup", L"RadianceHitGroup" };
+ 	D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION assoc = {};
+-	assoc.pSubobjectToAssociate = &subobjects[4];
++	assoc.pSubobjectToAssociate = &subobjects[5];
+ 	assoc.NumExports = _countof(localExports);
+ 	assoc.pExports = localExports;
+ 
+@@ -3064,9 +3424,11 @@ static int glRaytracingLightingCreateShaderTables(void)
+ {
+ 	void* raygenId = g_glRaytracingLighting.rtStateProps->GetShaderIdentifier(L"RayGen");
+ 	void* missId = g_glRaytracingLighting.rtStateProps->GetShaderIdentifier(L"ShadowMiss");
++	void* radianceMissId = g_glRaytracingLighting.rtStateProps->GetShaderIdentifier(L"RadianceMiss");
+ 	void* hitId = g_glRaytracingLighting.rtStateProps->GetShaderIdentifier(L"ShadowHitGroup");
++	void* radianceHitId = g_glRaytracingLighting.rtStateProps->GetShaderIdentifier(L"RadianceHitGroup");
+ 
+-	if (!raygenId || !missId || !hitId)
++	if (!raygenId || !missId || !radianceMissId || !hitId || !radianceHitId)
+ 	{
+ 		glRaytracingFatal("Failed to fetch shader identifiers");
+ 		return 0;
+@@ -3084,14 +3446,14 @@ static int glRaytracingLightingCreateShaderTables(void)
+ 
+ 	g_glRaytracingLighting.missTable = glRaytracingCreateBuffer(
+ 		g_glRaytracingCmd.device.Get(),
+-		recordSize,
++		recordSize * 2,
+ 		D3D12_HEAP_TYPE_UPLOAD,
+ 		D3D12_RESOURCE_STATE_GENERIC_READ,
+ 		D3D12_RESOURCE_FLAG_NONE);
+ 
+ 	g_glRaytracingLighting.hitTable = glRaytracingCreateBuffer(
+ 		g_glRaytracingCmd.device.Get(),
+-		recordSize,
++		recordSize * 2,
+ 		D3D12_HEAP_TYPE_UPLOAD,
+ 		D3D12_RESOURCE_STATE_GENERIC_READ,
+ 		D3D12_RESOURCE_FLAG_NONE);
+@@ -3110,14 +3472,16 @@ static int glRaytracingLightingCreateShaderTables(void)
+ 	if (!glRaytracingMapCopy(g_glRaytracingLighting.raygenTable.resource.Get(), temp, recordSize))
+ 		return 0;
+ 
+-	memset(temp, 0, sizeof(temp));
+-	memcpy(temp, missId, shaderIdSize);
+-	if (!glRaytracingMapCopy(g_glRaytracingLighting.missTable.resource.Get(), temp, recordSize))
++	uint8_t missRecords[512] = {};
++	memcpy(missRecords, missId, shaderIdSize);
++	memcpy(missRecords + recordSize, radianceMissId, shaderIdSize);
++	if (!glRaytracingMapCopy(g_glRaytracingLighting.missTable.resource.Get(), missRecords, recordSize * 2))
+ 		return 0;
+ 
+-	memset(temp, 0, sizeof(temp));
+-	memcpy(temp, hitId, shaderIdSize);
+-	if (!glRaytracingMapCopy(g_glRaytracingLighting.hitTable.resource.Get(), temp, recordSize))
++	uint8_t hitRecords[512] = {};
++	memcpy(hitRecords, hitId, shaderIdSize);
++	memcpy(hitRecords + recordSize, radianceHitId, shaderIdSize);
++	if (!glRaytracingMapCopy(g_glRaytracingLighting.hitTable.resource.Get(), hitRecords, recordSize * 2))
+ 		return 0;
+ 
+ 	return 1;
+@@ -3176,6 +3540,29 @@ static void glRaytracingLightingCreatePerPassDescriptors(const glRaytracingLight
+ 		&tlasSrv,
+ 		glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 5));
+ 
++	D3D12_SHADER_RESOURCE_VIEW_DESC materialSrv = {};
++	materialSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++	materialSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++	materialSrv.Format = DXGI_FORMAT_UNKNOWN;
++	materialSrv.Buffer.FirstElement = 0;
++	materialSrv.Buffer.NumElements = GL_RAYTRACING_MAX_MATERIALS;
++	materialSrv.Buffer.StructureByteStride = sizeof(glRaytracingMaterial_t);
++	materialSrv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
++	g_glRaytracingCmd.device->CreateShaderResourceView(
++		g_glRaytracingLighting.materialBuffer.resource.Get(),
++		&materialSrv,
++		glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 6));
++
++	D3D12_SHADER_RESOURCE_VIEW_DESC historySrv = {};
++	historySrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++	historySrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++	historySrv.Format = pass->outputFormat;
++	historySrv.Texture2D.MipLevels = 1;
++	g_glRaytracingCmd.device->CreateShaderResourceView(
++		g_glRaytracingLighting.historyTexture.Get(),
++		&historySrv,
++		glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 7));
++
+ 	D3D12_UNORDERED_ACCESS_VIEW_DESC outputUav = {};
+ 	outputUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+ 	outputUav.Format = pass->outputFormat;
+@@ -3183,7 +3570,7 @@ static void glRaytracingLightingCreatePerPassDescriptors(const glRaytracingLight
+ 		pass->outputTexture,
+ 		nullptr,
+ 		&outputUav,
+-		glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 6));
++		glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 8));
+ }
+ 
+ // ============================================================
+@@ -3208,6 +3595,7 @@ bool glRaytracingLightingInit(void)
+ 		return false;
+ 
+ 	glRaytracingLightingCreatePersistentLightSRV();
++	glRaytracingLightingCreatePersistentMaterialSRV();
+ 
+ 	if (!glRaytracingLightingCreateStateObject())
+ 		return false;
+@@ -3240,6 +3628,16 @@ bool glRaytracingLightingInit(void)
+ 	g_glRaytracingLighting.constants.sunColor[0] = 1.0f;
+ 	g_glRaytracingLighting.constants.sunColor[1] = 0.92f;
+ 	g_glRaytracingLighting.constants.sunColor[2] = 0.80f;
++	g_glRaytracingLighting.constants.rtStrength = 1.35f;
++	g_glRaytracingLighting.constants.specularStrength = 2.0f;
++	g_glRaytracingLighting.constants.reflectionStrength = 1.25f;
++	g_glRaytracingLighting.constants.shadowStrength = 1.20f;
++	g_glRaytracingLighting.constants.denoiseStrength = 0.65f;
++	g_glRaytracingLighting.constants.temporalStrength = 0.55f;
++	g_glRaytracingLighting.constants.giStrength = 0.90f;
++	g_glRaytracingLighting.constants.materialCount = 1u;
++	g_glRaytracingLighting.constants.historyValid = 0u;
++	g_glRaytracingLighting.constants.materialMode = 1u;
+ 	g_glRaytracingLighting.syncAfterDispatch = 0u;
+ 
+ 	glRaytracingLightingUpdateConstants();
+@@ -3389,6 +3787,18 @@ void glRaytracingLightingSetDebugMode(uint32_t mode)
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++void glRaytracingLightingSetVisualOptions(float rtStrength, float specularStrength, float reflectionStrength, float shadowStrength, float denoiseStrength, float temporalStrength, float giStrength)
++{
++	g_glRaytracingLighting.constants.rtStrength = glRaytracingClamp<float>(rtStrength, 0.0f, 3.0f);
++	g_glRaytracingLighting.constants.specularStrength = glRaytracingClamp<float>(specularStrength, 0.0f, 4.0f);
++	g_glRaytracingLighting.constants.reflectionStrength = glRaytracingClamp<float>(reflectionStrength, 0.0f, 3.0f);
++	g_glRaytracingLighting.constants.shadowStrength = glRaytracingClamp<float>(shadowStrength, 0.0f, 2.0f);
++	g_glRaytracingLighting.constants.denoiseStrength = glRaytracingClamp<float>(denoiseStrength, 0.0f, 1.0f);
++	g_glRaytracingLighting.constants.temporalStrength = glRaytracingClamp<float>(temporalStrength, 0.0f, 0.95f);
++	g_glRaytracingLighting.constants.giStrength = glRaytracingClamp<float>(giStrength, 0.0f, 2.0f);
++	glRaytracingLightingUpdateConstants();
++}
++
+ void glRaytracingLightingSetPerformance(uint32_t maxLights, uint32_t shadowSamples, uint32_t aoSamples, uint32_t skySamples, int syncAfterDispatch)
+ {
+ 	g_glRaytracingLighting.constants.maxActiveLights = glRaytracingClamp<uint32_t>(maxLights, 0u, (uint32_t)GL_RAYTRACING_MAX_LIGHTS);
+@@ -3513,7 +3923,10 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	g_glRaytracingLighting.constants.lightCount =
+ 		(uint32_t)glRaytracingClamp<size_t>(g_glRaytracingLighting.cpuLights.size(), 0, maxActiveLights);
+ 
++	if (!glRaytracingLightingEnsureHistoryTexture(pass))
++		return false;
+ 	glRaytracingLightingUpdateLights();
++	glRaytracingLightingUpdateMaterialBuffer();
+ 	glRaytracingLightingUpdateConstants();
+ 	glRaytracingLightingCreatePerPassDescriptors(pass);
+ 
+@@ -3569,6 +3982,12 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 		pass->outputTexture,
+ 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+ 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++	glRaytracingTransition(
++		g_glRaytracingCmd.cmdList.Get(),
++		g_glRaytracingLighting.historyTexture.Get(),
++		g_glRaytracingLighting.historyState,
++		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++	g_glRaytracingLighting.historyState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+ 
+ 	ID3D12DescriptorHeap* heaps[] = { g_glRaytracingLighting.descriptorHeap.Get() };
+ 	g_glRaytracingCmd.cmdList->SetDescriptorHeaps(_countof(heaps), heaps);
+@@ -3581,7 +4000,7 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 		glRaytracingOffsetGpu(gpuBase, g_glRaytracingLighting.descriptorStride, 0));
+ 	g_glRaytracingCmd.cmdList->SetComputeRootDescriptorTable(
+ 		1,
+-		glRaytracingOffsetGpu(gpuBase, g_glRaytracingLighting.descriptorStride, 6));
++		glRaytracingOffsetGpu(gpuBase, g_glRaytracingLighting.descriptorStride, 8));
+ 	g_glRaytracingCmd.cmdList->SetComputeRootConstantBufferView(
+ 		2,
+ 		g_glRaytracingLighting.constantBuffer.gpuVA);
+@@ -3598,11 +4017,11 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	rays.RayGenerationShaderRecord.SizeInBytes = shaderRecordSize;
+ 
+ 	rays.MissShaderTable.StartAddress = g_glRaytracingLighting.missTable.gpuVA;
+-	rays.MissShaderTable.SizeInBytes = shaderRecordSize;
++	rays.MissShaderTable.SizeInBytes = shaderRecordSize * 2;
+ 	rays.MissShaderTable.StrideInBytes = shaderRecordSize;
+ 
+ 	rays.HitGroupTable.StartAddress = g_glRaytracingLighting.hitTable.gpuVA;
+-	rays.HitGroupTable.SizeInBytes = shaderRecordSize;
++	rays.HitGroupTable.SizeInBytes = shaderRecordSize * 2;
+ 	rays.HitGroupTable.StrideInBytes = shaderRecordSize;
+ 
+ 	rays.Width = dispatchWidth;
+@@ -3645,14 +4064,33 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	uav.UAV.pResource = pass->outputTexture;
+ 	g_glRaytracingCmd.cmdList->ResourceBarrier(1, &uav);
+ 
+-	// The shim composites the lighting texture later in glLightScene().  Do not
+-	// copy directly to the swapchain here; doing so races the normal backbuffer
+-	// resolve/upscale path and can be overwritten before Present.
++	// Save a history copy after the ray pass. M3 temporal accumulation reads this
++	// on the next frame to reduce RT shimmer/noise without blurring the full-res
++	// raster texture detail.
+ 	glRaytracingTransition(
+ 		g_glRaytracingCmd.cmdList.Get(),
+ 		pass->outputTexture,
+ 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++		D3D12_RESOURCE_STATE_COPY_SOURCE);
++	glRaytracingTransition(
++		g_glRaytracingCmd.cmdList.Get(),
++		g_glRaytracingLighting.historyTexture.Get(),
++		g_glRaytracingLighting.historyState,
++		D3D12_RESOURCE_STATE_COPY_DEST);
++	g_glRaytracingLighting.historyState = D3D12_RESOURCE_STATE_COPY_DEST;
++	g_glRaytracingCmd.cmdList->CopyResource(g_glRaytracingLighting.historyTexture.Get(), pass->outputTexture);
++	glRaytracingTransition(
++		g_glRaytracingCmd.cmdList.Get(),
++		g_glRaytracingLighting.historyTexture.Get(),
++		g_glRaytracingLighting.historyState,
++		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++	g_glRaytracingLighting.historyState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++	glRaytracingTransition(
++		g_glRaytracingCmd.cmdList.Get(),
++		pass->outputTexture,
++		D3D12_RESOURCE_STATE_COPY_SOURCE,
+ 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++	g_glRaytracingLighting.constants.historyValid = 1u;
+ 
+ 	if (!glRaytracingEndCmd())
+ 		return false;
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index 800ba4e..e81f30b 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1716,6 +1716,7 @@ void                       glRaytracingLightingSetShadowBias(float bias);
+ void                       glRaytracingLightingSetExposure(float exposure);
+ void                       glRaytracingLightingSetLegacyBlend(float legacyBlend);
+ void                       glRaytracingLightingSetDebugMode(uint32_t mode);
++void                       glRaytracingLightingSetVisualOptions(float rtStrength, float specularStrength, float reflectionStrength, float shadowStrength, float denoiseStrength, float temporalStrength, float giStrength);
+ void                       glRaytracingLightingSetPerformance(uint32_t maxLights, uint32_t shadowSamples, uint32_t aoSamples, uint32_t skySamples, int syncAfterDispatch);
+ void                       glRaytracingLightingSetSun(int enabled, float dirX, float dirY, float dirZ, float r, float g, float b, float intensity, float shadowStrength);
+ 
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index e67c5ef..29f44df 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1320,6 +1320,15 @@ static void RB_RunRaytracedLightingPass(void)
+ 		glRaytracingLightingSetDebugMode(0);
+ 	}
+ 
++	glRaytracingLightingSetVisualOptions(
++		r_dxrRTStrength ? r_dxrRTStrength->value : 1.35f,
++		r_dxrSpecularStrength ? r_dxrSpecularStrength->value : 2.0f,
++		r_dxrReflectionStrength ? r_dxrReflectionStrength->value : 1.25f,
++		r_dxrShadowStrength ? r_dxrShadowStrength->value : 1.20f,
++		r_dxrDenoiseStrength ? r_dxrDenoiseStrength->value : 0.65f,
++		r_dxrTemporalStrength ? r_dxrTemporalStrength->value : 0.55f,
++		r_dxrGIStrength ? r_dxrGIStrength->value : 0.90f);
++
+ 	RB_ApplyDXRPerformanceSettings();
+ 	RB_ApplyDXRSunSettings();
+ 	RB_AddDXRFallbackLightIfNeeded();
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 0130514..3dd5fe0 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -115,6 +115,13 @@ cvar_t  *r_dxrForceSafeFullLighting;
+ cvar_t  *r_dxrSafeFullMaxPixels;
+ cvar_t  *r_dxrValidateSBT;
+ cvar_t  *r_dxrValidateUAV;
++cvar_t  *r_dxrRTStrength;
++cvar_t  *r_dxrSpecularStrength;
++cvar_t  *r_dxrReflectionStrength;
++cvar_t  *r_dxrShadowStrength;
++cvar_t  *r_dxrDenoiseStrength;
++cvar_t  *r_dxrTemporalStrength;
++cvar_t  *r_dxrGIStrength;
+ 
+ cvar_t  *r_waterFogColor;   //----(SA)	added
+ cvar_t  *r_mapFogColor;
+@@ -1066,6 +1073,13 @@ void R_Register( void ) {
+ 	r_dxrSafeFullMaxPixels = ri.Cvar_Get( "r_dxrSafeFullMaxPixels", "14400", CVAR_ARCHIVE );
+ 	r_dxrValidateSBT = ri.Cvar_Get( "r_dxrValidateSBT", "1", CVAR_ARCHIVE );
+ 	r_dxrValidateUAV = ri.Cvar_Get( "r_dxrValidateUAV", "1", CVAR_ARCHIVE );
++	r_dxrRTStrength = ri.Cvar_Get( "r_dxrRTStrength", "1.45", CVAR_ARCHIVE );
++	r_dxrSpecularStrength = ri.Cvar_Get( "r_dxrSpecularStrength", "2.15", CVAR_ARCHIVE );
++	r_dxrReflectionStrength = ri.Cvar_Get( "r_dxrReflectionStrength", "1.35", CVAR_ARCHIVE );
++	r_dxrShadowStrength = ri.Cvar_Get( "r_dxrShadowStrength", "1.25", CVAR_ARCHIVE );
++	r_dxrDenoiseStrength = ri.Cvar_Get( "r_dxrDenoiseStrength", "0.65", CVAR_ARCHIVE );
++	r_dxrTemporalStrength = ri.Cvar_Get( "r_dxrTemporalStrength", "0.55", CVAR_ARCHIVE );
++	r_dxrGIStrength = ri.Cvar_Get( "r_dxrGIStrength", "0.90", CVAR_ARCHIVE );
+ 	r_finish = ri.Cvar_Get( "r_finish", "0", CVAR_ARCHIVE );
+ 	r_textureMode = ri.Cvar_Get( "r_textureMode", "GL_LINEAR_MIPMAP_NEAREST", CVAR_ARCHIVE );
+ 	r_swapInterval = ri.Cvar_Get( "r_swapInterval", "0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 3ae66e8..aeb9001 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1170,6 +1170,13 @@ extern cvar_t   *r_dxrForceSafeFullLighting; // hard-cap mode 4 dispatch dimensi
+ extern cvar_t   *r_dxrSafeFullMaxPixels; // hard pixel cap for full lighting mode
+ extern cvar_t   *r_dxrValidateSBT;      // validate shader binding tables before DispatchRays
+ extern cvar_t   *r_dxrValidateUAV;      // validate output UAV before DispatchRays
++extern cvar_t   *r_dxrRTStrength;       // M2/M3 visual restore: overall RT contribution
++extern cvar_t   *r_dxrSpecularStrength; // M2 material/specular highlight strength
++extern cvar_t   *r_dxrReflectionStrength; // M2 reflection/material-hit strength
++extern cvar_t   *r_dxrShadowStrength;   // RT shadow/contact shadow contrast
++extern cvar_t   *r_dxrDenoiseStrength;  // M3 spatial denoise strength
++extern cvar_t   *r_dxrTemporalStrength; // M3 history accumulation strength
++extern cvar_t   *r_dxrGIStrength;       // M3 sky/GI bounce strength
+ 
+ extern cvar_t  *r_norefresh;            // bypasses the ref rendering
+ extern cvar_t  *r_drawentities;         // disable/enable entity rendering
