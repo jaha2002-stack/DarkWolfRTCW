@@ -40,6 +40,66 @@ function Test-LabMarkers {
     return $true
 }
 
+function Test-HlslChunkFix {
+    param([string]$Root)
+
+    $path = Join-Path $Root 'src/opengl/gl_d3d12raylight.cpp'
+    if (!(Test-Path -LiteralPath $path)) { return $false }
+    $text = [IO.File]::ReadAllText($path)
+    return $text.Contains('g_glRaytracingLightingHlslParts[]') -and
+        $text.Contains('glRaytracingBuildLightingHlslSource()') -and
+        $text.Contains('glRaytracingLightingCompileLibrary(hlslSource.c_str(), hlslSource.size())')
+}
+
+function Install-HlslChunkSourceOverride {
+    param([string]$Root)
+
+    $relative = 'src/opengl/gl_d3d12raylight.cpp'
+    $source = Join-Path (Join-Path $Root 'source-overrides') $relative
+    $destination = Join-Path $Root $relative
+    if (!(Test-Path -LiteralPath $source)) {
+        throw "Missing MSVC-safe HLSL source snapshot: $source"
+    }
+
+    [IO.File]::WriteAllBytes($destination, [IO.File]::ReadAllBytes($source))
+    Write-Host "Installed MSVC-safe split-HLSL source snapshot: $relative"
+
+    if (!(Test-HlslChunkFix -Root $Root)) {
+        throw 'The split embedded HLSL source snapshot was copied, but its required markers are missing.'
+    }
+}
+
+function Apply-HlslChunkPatchOrOverride {
+    param([string]$Root, [string]$PatchPath)
+
+    if (Test-HlslChunkFix -Root $Root) {
+        Write-Host 'MSVC-safe split embedded HLSL is already present; skipping build-fix application.'
+        return
+    }
+
+    if (Test-Path -LiteralPath $PatchPath) {
+        $check = Invoke-GitChecked @('apply', '--check', $PatchPath)
+        if ($check.Code -eq 0) {
+            $apply = Invoke-GitChecked @('apply', '--whitespace=nowarn', $PatchPath)
+            if ($apply.Code -eq 0 -and (Test-HlslChunkFix -Root $Root)) {
+                Write-Host "Applied MSVC embedded-HLSL build fix: $PatchPath"
+                return
+            }
+            Write-Warning "Patch 09 could not be installed cleanly; using deterministic source snapshot instead.`n$($apply.Output)"
+        }
+        else {
+            $reverse = Invoke-GitChecked @('apply', '--reverse', '--check', $PatchPath)
+            if ($reverse.Code -eq 0 -and (Test-HlslChunkFix -Root $Root)) {
+                Write-Host "MSVC embedded-HLSL build fix already applied: $PatchPath"
+                return
+            }
+            Write-Warning "Patch 09 does not match this checkout's exact source context; using deterministic source snapshot."
+        }
+    }
+
+    Install-HlslChunkSourceOverride -Root $Root
+}
+
 function Install-LabSourceOverrides {
     param([string]$Root)
 
@@ -151,6 +211,9 @@ try {
     if (!(Test-LabMarkers -Root $RepoRoot)) {
         throw 'RT Effects Lab source application completed without all required markers.'
     }
+
+    Write-Host 'Applying the MSVC embedded-HLSL size build fix...'
+    Apply-HlslChunkPatchOrOverride -Root $RepoRoot -PatchPath (Join-Path $RepoRoot 'patches/09-dxr-lab-msvc-split-embedded-hlsl.patch')
 }
 finally {
     Pop-Location

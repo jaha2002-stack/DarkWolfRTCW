@@ -10,6 +10,7 @@ $checks = @(
     @{ Path='src/opengl/opengl.h'; Text='typedef struct glRaytracingEffectsOptions_s' },
     @{ Path='src/opengl/opengl.h'; Text='glRaytracingLightingSetEffectsOptions' },
     @{ Path='src/opengl/gl_d3d12raylight.cpp'; Text='GL_RAYTRACING_LAB_DESCRIPTORS_PER_PASS = 9' },
+    @{ Path='src/opengl/gl_d3d12raylight.cpp'; Text='g_glRaytracingLightingHlslParts[]' },
     @{ Path='src/opengl/gl_d3d12raylight.cpp'; Text='static_assert(sizeof(glRaytracingLightingConstants_t) == 480' },
     @{ Path='src/opengl/gl_d3d12raylight.cpp'; Text='float4 ResolveLabPixel(uint2 pixel)' },
     @{ Path='src/opengl/gl_d3d12raylight.cpp'; Text='Filter only the RT/light residual' },
@@ -66,13 +67,28 @@ if ($scalarCount.Sum -ne 64) {
 
 $rayPath = Join-Path $RepoRoot 'src/opengl/gl_d3d12raylight.cpp'
 $ray = [IO.File]::ReadAllText($rayPath)
-$marker = 'static const char* g_glRaytracingLightingHlsl = R"('
-$hlslStart = $ray.IndexOf($marker, [StringComparison]::Ordinal)
-if ($hlslStart -lt 0) { throw 'Embedded Lab HLSL start marker is missing.' }
-$hlslStart += $marker.Length
-$hlslEnd = $ray.IndexOf(')";', $hlslStart, [StringComparison]::Ordinal)
-if ($hlslEnd -lt 0) { throw 'Embedded Lab HLSL end marker is missing.' }
-$hlsl = $ray.Substring($hlslStart, $hlslEnd - $hlslStart)
+$chunkMarker = 'static const char* const g_glRaytracingLightingHlslParts[] ='
+$hlslStart = $ray.IndexOf($chunkMarker, [StringComparison]::Ordinal)
+if ($hlslStart -lt 0) { throw 'MSVC-safe embedded Lab HLSL chunk array is missing.' }
+$chunkEndMarker = 'static std::string glRaytracingBuildLightingHlslSource()'
+$hlslEnd = $ray.IndexOf($chunkEndMarker, $hlslStart, [StringComparison]::Ordinal)
+if ($hlslEnd -lt 0) { throw 'Embedded Lab HLSL chunk block end marker is missing.' }
+$chunkBlock = $ray.Substring($hlslStart, $hlslEnd - $hlslStart)
+$chunkMatches = [regex]::Matches($chunkBlock, '(?s)R"DXRHLSL\((.*?)\)DXRHLSL"')
+if ($chunkMatches.Count -lt 2) { throw "Expected multiple MSVC-safe HLSL chunks, found $($chunkMatches.Count)." }
+$builder = [Text.StringBuilder]::new()
+foreach ($match in $chunkMatches) {
+    $chunk = $match.Groups[1].Value
+    $chunkBytes = [Text.Encoding]::UTF8.GetByteCount($chunk)
+    if ($chunkBytes -gt 8000) {
+        throw "Embedded HLSL chunk exceeds the conservative 8000-byte limit: $chunkBytes bytes."
+    }
+    [void]$builder.Append($chunk)
+}
+$hlsl = $builder.ToString()
+if (!$ray.Contains('glRaytracingLightingCompileLibrary(hlslSource.c_str(), hlslSource.size())')) {
+    throw 'Runtime HLSL assembly/compile call is missing.'
+}
 
 foreach ($pair in @(@('{','}'), @('(',')'), @('[',']'))) {
     $openCount = ($hlsl.ToCharArray() | Where-Object { $_ -eq $pair[0] }).Count
@@ -82,7 +98,7 @@ foreach ($pair in @(@('{','}'), @('(',')'), @('[',']'))) {
     }
 }
 
-Write-Host 'DXR CleanVisual RT Effects Lab static source verification passed.'
+Write-Host "DXR CleanVisual RT Effects Lab static source verification passed; HLSL chunks: $($chunkMatches.Count), total bytes: $([Text.Encoding]::UTF8.GetByteCount($hlsl))."
 Write-Host 'Effect constants: 64 x 32-bit scalars (256 bytes); total lighting cbuffer payload expected: 480 bytes.'
 $global:LASTEXITCODE = 0
 exit 0

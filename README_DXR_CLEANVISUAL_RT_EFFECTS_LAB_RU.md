@@ -196,3 +196,7 @@ Full-resolution denoiser использует второй resolve-dispatch бе
 В первой версии patch 08 был создан против одного точного состояния исходников Performance v2. Если в репозитории уже находились файлы предыдущих DarkWolf kits, `git apply` мог отклонить patch из-за несовпадения контекста, хотя базовый Performance v2 успешно применялся.
 
 В v2 apply-скрипт сначала пытается применить обычный patch. При несовпадении контекста он автоматически устанавливает шесть проверенных source snapshots из `source-overrides/`, после чего обязательный verify-step проверяет cvars, shader markers, per-surface shadow-caster cache и структуру constant buffer. Это исправляет ошибку `Patch cannot be applied and is not already present` без отключения проверки исходников.
+
+## Исправление v3 для MSVC C2026
+
+В v3 встроенный HLSL разделён на несколько строковых chunks. Это устраняет `error C2026: string too big, trailing characters truncated`, не меняя сам shader и визуальные настройки. См. `README_MSVC_HLSL_BUILD_FIX_RU.md`.

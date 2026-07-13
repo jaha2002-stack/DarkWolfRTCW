@@ -12,13 +12,40 @@ if (!(Test-Path -LiteralPath $sourcePath)) {
 }
 
 $text = [IO.File]::ReadAllText($sourcePath)
-$marker = 'static const char* g_glRaytracingLightingHlsl = R"('
-$start = $text.IndexOf($marker, [StringComparison]::Ordinal)
-if ($start -lt 0) { throw 'Embedded HLSL start marker not found.' }
-$start += $marker.Length
-$end = $text.IndexOf(')";', $start, [StringComparison]::Ordinal)
-if ($end -lt 0) { throw 'Embedded HLSL end marker not found.' }
-$hlsl = $text.Substring($start, $end - $start)
+
+$chunkMarker = 'static const char* const g_glRaytracingLightingHlslParts[] ='
+$chunkStart = $text.IndexOf($chunkMarker, [StringComparison]::Ordinal)
+if ($chunkStart -ge 0) {
+    $chunkEndMarker = 'static std::string glRaytracingBuildLightingHlslSource()'
+    $chunkEnd = $text.IndexOf($chunkEndMarker, $chunkStart, [StringComparison]::Ordinal)
+    if ($chunkEnd -lt 0) { throw 'Embedded HLSL chunk block end marker not found.' }
+
+    $chunkBlock = $text.Substring($chunkStart, $chunkEnd - $chunkStart)
+    $chunkMatches = [regex]::Matches($chunkBlock, '(?s)R"DXRHLSL\((.*?)\)DXRHLSL"')
+    if ($chunkMatches.Count -eq 0) { throw 'No embedded HLSL chunks were found.' }
+
+    $builder = [Text.StringBuilder]::new()
+    foreach ($match in $chunkMatches) {
+        $chunk = $match.Groups[1].Value
+        $chunkBytes = [Text.Encoding]::UTF8.GetByteCount($chunk)
+        if ($chunkBytes -gt 8000) {
+            throw "Embedded HLSL chunk is too large for conservative MSVC limits: $chunkBytes bytes."
+        }
+        [void]$builder.Append($chunk)
+    }
+    $hlsl = $builder.ToString()
+    Write-Host "Extracted $($chunkMatches.Count) MSVC-safe HLSL chunks ($([Text.Encoding]::UTF8.GetByteCount($hlsl)) bytes total)."
+}
+else {
+    # Backward-compatible extraction for older kit snapshots.
+    $marker = 'static const char* g_glRaytracingLightingHlsl = R"('
+    $start = $text.IndexOf($marker, [StringComparison]::Ordinal)
+    if ($start -lt 0) { throw 'Embedded HLSL start marker not found.' }
+    $start += $marker.Length
+    $end = $text.IndexOf(')";', $start, [StringComparison]::Ordinal)
+    if ($end -lt 0) { throw 'Embedded HLSL end marker not found.' }
+    $hlsl = $text.Substring($start, $end - $start)
+}
 
 $tempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
 $hlslPath = Join-Path $tempRoot 'darkwolf_dxr_effects_lab.hlsl'
